@@ -21,6 +21,7 @@ from controller_settings import controller_settings
 from ethernet_settings import ethernet_settings
 from wlan_settings import access_point_settings, wireless_settings
 from wwan_settings import wwan_settings
+import makeAgent as agent
 
 logger = logging.getLogger(__name__)
 
@@ -346,6 +347,8 @@ def setup_logging():
 
 def main():
     setup_logging()
+    logger.info("Creating bluetooth agent")
+    threading.Thread(target=agent.create_bt_agent).start()
     logger.info("go-bluetooth server starting")
     conf = get_conf()
     auth.set_passkey(conf.get("pass_hash"))
