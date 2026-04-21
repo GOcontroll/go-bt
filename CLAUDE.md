@@ -112,5 +112,7 @@ controller_model=l4   # optioneel, overschrijft DT-detectie
 ## Commit- en branchconventies
 
 - Branch: `feature/ble-gatt-rewrite`
-- Commits als: `Rick-GO <rickgijsberts@gocontroll.com>` — geen co-auteur
+- **Elke commit** als `Rick-GO <rickgijsberts@gocontroll.com>` — author én committer, geen co-auteur
+- Gebruik altijd: `git -c user.name="Rick-GO" -c user.email="rickgijsberts@gocontroll.com" commit -m "..."`
+- Nooit een `Co-Authored-By` trailer toevoegen
 - Commit bericht formaat: `type(scope): beschrijving`
