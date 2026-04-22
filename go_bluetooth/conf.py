@@ -1,126 +1,93 @@
 import hashlib
 import logging
 
-import netifaces
-
 logger = logging.getLogger(__name__)
 
-conf = None
-
-# features
-features = {
-    "verify_device": False,
-    "update_controller": False,
-    "file_transfer": False,
-    "controller_settings": False,
-    "wireless_settings": False,
-    "ap_settings": False,
-    "ethernet_settings": False,
-    "controller_programs": False,
-    "wwan_settings": False,
-    "can_settings": False,
-    "controller_configuration": False,
-    "module_settings": False,
-    "reboot_controller": False,
-    "controller_communication_menu": False,
-    "controller_monitoring": False,
-    "usb_settings": False,
-    "nbiot_settings": False,
-    "gps_settings": False,
-    "lin_settings": False,
-}
+_conf = None
 
 
-def parse_boolean(boolean: str) -> bool:
-    if boolean.lower() in ["y", "yes", "true"]:
+def parse_boolean(value: str) -> bool:
+    if value.lower() in ('y', 'yes', 'true'):
         return True
-    elif boolean.lower() in ["n", "no", "false"]:
+    if value.lower() in ('n', 'no', 'false'):
         return False
-    else:
-        raise ValueError
+    raise ValueError(f'Not a boolean: {value!r}')
 
 
-def parse_conf(conf_file):
-    global features
+def parse_conf(conf_file) -> dict:
     conf_dict = {}
     for line in conf_file:
-        if line.startswith("#"):
+        line = line.strip()
+        if not line or line.startswith('#'):
             continue
-        option = line.split("=", 1)
-        if len(option) == 2:
-            try:
-                conf_dict[option[0].strip().lower()] = parse_boolean(option[1].strip())
-            except ValueError:
-                conf_dict[option[0].strip().lower()] = option[1].strip()
-    for key in features.keys():
-        feature = conf_dict.get(key, False)
-        if isinstance(feature, bool):
-            features[key] = feature
+        key, _, val = line.partition('=')
+        key = key.strip().lower()
+        val = val.strip()
+        if not key:
+            continue
+        try:
+            conf_dict[key] = parse_boolean(val)
+        except ValueError:
+            conf_dict[key] = val
     return conf_dict
 
 
 def get_conf() -> dict:
-    global conf
-    if conf is not None:
-        return conf
+    global _conf
+    if _conf is not None:
+        return _conf
     try:
-        with open("/etc/go_bluetooth.conf", "r") as conf_file:
-            conf = parse_conf(conf_file)
-            return conf
+        with open('/etc/go_bluetooth.conf', 'r') as f:
+            _conf = parse_conf(f)
     except FileNotFoundError:
-        conf = create_default_conf()
-        return conf
+        _conf = _create_default_conf()
+    return _conf
 
 
-def create_default_conf():
-    with open("/etc/go_bluetooth.conf", "x") as conf_file:
-        mac = netifaces.ifaddresses("end0")[netifaces.AF_LINK][0]["addr"]
-        default_hash = hashlib.sha256(mac.encode()).hexdigest()
-        default_conf = f"""
-#set pass_hash with a sha256 of your passkey, the default value is the hash of the ethernet mac address
-pass_hash={default_hash}
-verify_device=true
-update_controller=false
-file_transfer=false
-controller_settings=true
-wireless_settings=true
-ap_settings=true
-ethernet_settings=true
-controller_programs=true
-wwan_settings=true
-can_settings=true
-controller_configuration=true
-module_settings=true
-reboot_controller=true
-controller_communication_menu=true
-controller_monitoring=false
-usb_settings=false
-nbiot_settings=false
-gps_settings=false
-lin_settings=false
-"""
-        conf_file.write(default_conf)
-        return parse_conf(default_conf)
-
-
-def modify_conf(key: str, val: str):
+def _create_default_conf() -> dict:
+    mac = _read_mac()
+    default_hash = hashlib.sha256(mac.encode()).hexdigest()
+    content = (
+        '# GOcontroll BLE server configuration\n'
+        '# pass_hash is SHA256 of the passkey; default is SHA256 of the ethernet MAC\n'
+        f'pass_hash={default_hash}\n'
+        'verify_device=true\n'
+    )
     try:
-        conf = get_conf()
-    except FileNotFoundError:
-        create_default_conf()
+        with open('/etc/go_bluetooth.conf', 'x') as f:
+            f.write(content)
+    except (FileExistsError, PermissionError) as e:
+        logger.warning(f'Could not write default conf: {e}')
+    return parse_conf(content.splitlines(keepends=True))
+
+
+def _read_mac() -> str:
+    for iface in ('end0', 'eth0'):
+        try:
+            with open(f'/sys/class/net/{iface}/address') as f:
+                return f.read().strip()
+        except FileNotFoundError:
+            continue
+    return 'de:ad:be:ef:00:01'
+
+
+def get_controller_model() -> str:
+    """Detect controller model: l4 / m1 / hmi1."""
     conf = get_conf()
-    conf[key] = val
-    write_conf(conf)
+    if 'controller_model' in conf:
+        return str(conf['controller_model']).lower()
+    try:
+        with open('/sys/firmware/devicetree/base/hardware') as f:
+            hw = f.read().lower()
+        for model in ('hmi1', 'm1', 'l4'):
+            if model in hw:
+                return model
+    except FileNotFoundError:
+        pass
+    return 'l4'
 
 
 def write_conf(conf: dict):
-    with open("/etc/go_webui.conf", "w") as conf_file:
+    with open('/etc/go_bluetooth.conf', 'w') as f:
         for key, value in conf.items():
-            if key in ["pass_hash"]:
-                conf_file.write(f"{key}={value}\n")
-            pass
-
-
-def get_features():
-    global features
-    return features
+            f.write(f'{key}={value}\n')

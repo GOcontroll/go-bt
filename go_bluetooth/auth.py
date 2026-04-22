@@ -1,58 +1,43 @@
-import hashlib
+import logging
 
-import rfcommServerConstants as commands
-import server
+logger = logging.getLogger(__name__)
 
-current_passkey = ""
-trust_device = False
-
-def set_trust(trusted: bool):
-    global trust_device
-    trust_device = trusted
-
-def get_trust() -> bool:
-    global trust_device
-    return trust_device
-
-def set_passkey(key: str):
-    global current_passkey
-    current_passkey = key
+TRUSTED_DEVICES_FILE = '/etc/bluetooth/trusted_devices.txt'
 
 
-def get_passkey() -> str:
-    global current_passkey
-    return current_passkey
+class Auth:
+    def __init__(self, passkey_hash: str, verify_device: bool = True):
+        self._hash = passkey_hash.lower()
+        self._verify = verify_device
+        self._authenticated = False
 
-
-def verify_device(commandnmbr, arg):
-    level1 = ord(arg[0])
-    arg = arg[1:]
-
-    if level1 == commands.DEVICE_VERIFICATION_ATTEMPT:
-        split_arg = arg.split(":")
-        device_id = split_arg[-1]
-        entered_key = ":".join(split_arg[:-1]).lower()
-        entered_hash = hashlib.sha256(entered_key.encode()).hexdigest()
-        if get_passkey() == entered_hash:
-            set_trust(True)
-            with open("/etc/bluetooth/trusted_devices.txt", "a") as add_trusted_device:
-                add_trusted_device.write(device_id + "\n")
-            request_verification(commands.DEVICE_VERIFICATION_SUCCESS)
+    def attempt(self, hash_hex: str) -> bool:
+        if hash_hex.lower() == self._hash:
+            self._authenticated = True
+            logger.info('Authentication successful')
         else:
-            request_verification(commands.DEVICE_VERIFICATION_INCORRECT_PASSKEY)
+            logger.warning('Authentication failed — wrong passkey hash')
+        return self._authenticated
 
-    elif level1 == commands.DEVICE_VERIFICATION_EXCHANGE_KEY:
+    def require(self):
+        if self._verify and not self._authenticated:
+            raise PermissionError('auth_required')
+
+    @property
+    def authenticated(self) -> bool:
+        return self._authenticated or not self._verify
+
+    def check_trusted(self, ble_mac: str) -> bool:
         try:
-            with open("/etc/bluetooth/trusted_devices.txt", "r") as trusted_devices:
-                if trusted_devices.read().find(arg) != -1:
-                    set_trust(True)
-                    request_verification(commands.DEVICE_VERIFICATION_SUCCESS)
-                else:
-                    request_verification(commands.DEVICE_VERIFICATION_MISSING)
+            with open(TRUSTED_DEVICES_FILE) as f:
+                if ble_mac in f.read():
+                    self._authenticated = True
+                    logger.info(f'Trusted device {ble_mac!r} — auto-authenticated')
         except FileNotFoundError:
-            request_verification(commands.DEVICE_VERIFICATION_MISSING)
+            pass
+        return self._authenticated
 
-
-# part of the verification structure but is called from multiple places
-def request_verification(char):
-    server.send(chr(commands.VERIFY_DEVICE) + chr(char))
+    def add_trusted(self, ble_mac: str):
+        with open(TRUSTED_DEVICES_FILE, 'a') as f:
+            f.write(ble_mac + '\n')
+        logger.info(f'Added trusted device {ble_mac!r}')

@@ -7,12 +7,10 @@ authors = [
 description = "The backend for the GOcontroll Configuration android app"
 classifiers = [
 ]
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 dependencies = [
-	"bluedot",
 	"pymoduline",
-	"python-dbus",
-	"netifaces"
+	"python-dbus"
 ]
 
 [project.readme]
