@@ -29,7 +29,7 @@ FLASH_PHASE_INSTALL   = 3
 FLASH_PHASE_DONE      = 4
 FLASH_PHASE_ERROR     = 5
 
-OTA_BIN_PATH = '/tmp/go_bluetooth_ota.bin'
+OTA_BIN_PATH = '/tmp/go_bt_ota.bin'
 
 
 class OtaService:

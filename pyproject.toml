@@ -1,5 +1,5 @@
 [project]
-name = "go-bluetooth"
+name = "go-bt"
 version = "1.0.0"
 authors = [
 	{ name = "Maud Spierings", email = "maudspierings@gocontroll.com" }
@@ -18,6 +18,6 @@ file = "README.md"
 content-type = "text/markdown"
 
 [project.urls]
-Homepage = "https://github.com/GOcontroll/go-bluetooth"
+Homepage = "https://github.com/GOcontroll/go-bt"
 
 

@@ -1,10 +1,10 @@
-# go-bluetooth — CLAUDE.md
+# go-bt — CLAUDE.md
 
 ## Project context
 
 Dit is de BLE server die draait op GOcontroll Linux controllers (Moduline L4, M1, HMI1). De server maakt het mogelijk voor een iOS/Android app om de controller te monitoren en te configureren via Bluetooth Low Energy.
 
-De huidige code in `go_bluetooth/` is een **verouderde RFCOMM implementatie** (Classic Bluetooth, niet BLE) gebouwd op de `bluedot` library. Die implementatie wordt volledig vervangen. De code mag als referentie dienen voor de bestaande functionaliteit, maar de architectuur en het protocol worden niet overgenomen.
+De huidige code (verwijderd) was een **verouderde RFCOMM implementatie** (Classic Bluetooth, niet BLE) gebouwd op de `bluedot` library. Die implementatie wordt volledig vervangen. De code mag als referentie dienen voor de bestaande functionaliteit, maar de architectuur en het protocol worden niet overgenomen.
 
 De actieve branch voor de nieuwe implementatie is `feature/ble-gatt-rewrite`.
 
@@ -55,8 +55,8 @@ Systeemtools die handlers aanroepen: `nmcli`, `ip`, `systemctl`, `ifup`/`ifdown`
 ## Bronstructuur (target)
 
 ```
-go_bluetooth/
-├── go_bluetooth.py         # entry point: BlueZ GATT registratie, advertising, main loop
+go_bt/
+├── go_bt.py                # entry point: BlueZ GATT registratie, advertising, main loop
 ├── gatt_server.py          # D-Bus scaffolding: GattService1, GattCharacteristic1
 ├── ota_service.py          # OTA service: DATA ontvangst, CONTROL parsing, STATUS updates
 ├── mgmt_service.py         # Management service: REQUEST dispatch, RESPONSE/TELEMETRY notificaties
@@ -91,7 +91,7 @@ go_bluetooth/
 |--------------------|-------|
 | `server.py` | RFCOMM-specifiek |
 | `rfcommServerConstants.py` | Vervangen door JSON protocol |
-| `go_bluetooth.py` (huidig) | Volledig herschreven |
+| `go_bt.py` (huidig) | Volledig herschreven |
 | `bluedot` dependency | Vervangen door BlueZ D-Bus GATT |
 | `netifaces` dependency | Vervangen door subprocess/nmcli |
 

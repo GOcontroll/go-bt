@@ -30,19 +30,19 @@ def setup_logging():
     root.addHandler(console)
 
     try:
-        fh = RotatingFileHandler('/var/log/go_bluetooth.log', maxBytes=5 * 1024 * 1024, backupCount=3)
+        fh = RotatingFileHandler('/var/log/go_bt.log', maxBytes=5 * 1024 * 1024, backupCount=3)
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(fmt)
         root.addHandler(fh)
     except PermissionError:
-        logger.warning('Cannot open /var/log/go_bluetooth.log — logging to console only')
+        logger.warning('Cannot open /var/log/go_bt.log — logging to console only')
 
 
 def main():
     setup_logging()
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
 
-    logger.info('go-bluetooth (BLE GATT) starting')
+    logger.info('go-bt (BLE GATT) starting')
 
     # BlueZ pairing agent in background thread
     threading.Thread(target=agent.create_bt_agent, daemon=True).start()

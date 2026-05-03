@@ -1,4 +1,4 @@
-name: Build and publish go-bluetooth package
+name: Build and publish go-bt package
 
 on:
   push:
@@ -24,31 +24,31 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${{ steps.version.outputs.version }}"
-          PACKAGE=go-bluetooth
+          PACKAGE=go-bt
           ARCH=all
           BUILD="${RUNNER_TEMP}/${PACKAGE}_${VERSION}_${ARCH}"
           DIST="${RUNNER_TEMP}/dist"
 
           mkdir -p "${BUILD}/DEBIAN" \
-                   "${BUILD}/opt/gocontroll/go-bluetooth" \
+                   "${BUILD}/opt/gocontroll/go-bt" \
                    "${BUILD}/lib/systemd/system" \
                    "${DIST}"
 
           # --- Python package files -----------------------------------------------
-          cp -r go_bluetooth "${BUILD}/opt/gocontroll/go-bluetooth/"
-          find "${BUILD}/opt/gocontroll/go-bluetooth" -name '__pycache__' -type d \
+          cp -r go_bt "${BUILD}/opt/gocontroll/go-bt/"
+          find "${BUILD}/opt/gocontroll/go-bt" -name '__pycache__' -type d \
             -exec rm -rf {} + 2>/dev/null || true
 
           # --- Systemd service file -----------------------------------------------
-          cat > "${BUILD}/lib/systemd/system/go-bluetooth.service" << 'SERVICE'
+          cat > "${BUILD}/lib/systemd/system/go-bt.service" << 'SERVICE'
           [Unit]
           Description=GOcontroll BLE GATT server
           After=bluetooth.target network.target
 
           [Service]
           Type=simple
-          Environment=PYTHONPATH=/opt/gocontroll/go-bluetooth
-          ExecStart=/usr/bin/python3 -m go_bluetooth
+          Environment=PYTHONPATH=/opt/gocontroll/go-bt
+          ExecStart=/usr/bin/python3 -m go_bt
           Restart=always
           RestartSec=5
 
@@ -61,8 +61,8 @@ jobs:
           #!/bin/sh
           set -e
           systemctl daemon-reload
-          systemctl enable go-bluetooth.service
-          systemctl restart go-bluetooth.service || true
+          systemctl enable go-bt.service
+          systemctl restart go-bt.service || true
           POSTINST
           chmod 755 "${BUILD}/DEBIAN/postinst"
 
@@ -70,8 +70,8 @@ jobs:
           cat > "${BUILD}/DEBIAN/prerm" << 'PRERM'
           #!/bin/sh
           set -e
-          systemctl stop go-bluetooth.service || true
-          systemctl disable go-bluetooth.service || true
+          systemctl stop go-bt.service || true
+          systemctl disable go-bt.service || true
           PRERM
           chmod 755 "${BUILD}/DEBIAN/prerm"
 
@@ -97,7 +97,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ runner.temp }}/dist/go-bluetooth_${{ steps.version.outputs.version }}_all.deb
+          files: ${{ runner.temp }}/dist/go-bt_${{ steps.version.outputs.version }}_all.deb
           generate_release_notes: true
 
       - name: Trigger go-apt index rebuild
@@ -108,8 +108,8 @@ jobs:
           event-type: rebuild-index
           client-payload: |
             {
-              "package": "go-bluetooth",
+              "package": "go-bt",
               "version": "${{ steps.version.outputs.version }}",
               "arch": "all",
-              "deb_url": "https://github.com/GOcontroll/go-bluetooth/releases/download/${{ github.ref_name }}/go-bluetooth_${{ steps.version.outputs.version }}_all.deb"
+              "deb_url": "https://github.com/GOcontroll/go-bt/releases/download/${{ github.ref_name }}/go-bt_${{ steps.version.outputs.version }}_all.deb"
             }
