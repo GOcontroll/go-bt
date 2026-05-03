@@ -72,18 +72,31 @@ def _read_mac() -> str:
 
 
 def get_controller_model() -> str:
-    """Detect controller model: l4 / m1 / hmi1."""
+    """Detect controller model: l4 / m1 / hmi1.
+
+    Source priority:
+      1. /sys/firmware/devicetree/base/platform — newer DTBs, e.g. "Moduline M1"
+      2. /sys/firmware/devicetree/base/model    — fallback for fielded units
+         without `platform`, e.g. "GOcontroll Moduline M1"
+
+    /…/hardware (e.g. "Moduline Mini V1.11") holds the board revision and does
+    NOT carry the model token — never use it for model detection.
+    """
     conf = get_conf()
     if 'controller_model' in conf:
         return str(conf['controller_model']).lower()
-    try:
-        with open('/sys/firmware/devicetree/base/hardware') as f:
-            hw = f.read().lower()
-        for model in ('hmi1', 'm1', 'l4'):
-            if model in hw:
-                return model
-    except FileNotFoundError:
-        pass
+    for path in (
+        '/sys/firmware/devicetree/base/platform',
+        '/sys/firmware/devicetree/base/model',
+    ):
+        try:
+            with open(path) as f:
+                tokens = f.read().rstrip('\x00').lower().split()
+            for model in ('hmi1', 'm1', 'l4'):
+                if model in tokens:
+                    return model
+        except FileNotFoundError:
+            continue
     return 'l4'
 
 

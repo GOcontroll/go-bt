@@ -2,6 +2,8 @@ import subprocess
 import logging
 from gi.repository import GLib
 
+from ..conf import get_controller_model
+
 logger = logging.getLogger(__name__)
 
 
@@ -24,18 +26,12 @@ def get_state() -> dict:
 
 def _info() -> dict:
     hw_revision = ''
-    model = 'l4'
     try:
         with open('/sys/firmware/devicetree/base/hardware', 'r') as f:
-            hw_raw = f.read().strip().rstrip('\x00')
-        hw_revision = hw_raw
-        hw_lower = hw_raw.lower()
-        for m in ('hmi1', 'm1', 'l4'):
-            if m in hw_lower:
-                model = m
-                break
+            hw_revision = f.read().strip().rstrip('\x00')
     except FileNotFoundError:
         pass
+    model = get_controller_model()
 
     kernel = ''
     try:
