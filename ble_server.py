@@ -2,49 +2,73 @@
 """
 go-bt — BLE GATT server for GOcontroll Linux controllers (L4 / M1 / HMI1).
 
-Stage 1 (Twilight-Flow scope): single primary service, three raw-binary
-characteristics, iOS-driven heartbeat watchdog. The goal of this stage is
-exclusively to prove the connection layer is rock-solid: scan, connect,
-read/notify, write, watchdog timeout, disconnect, reconnect.
+Phase 1 — hybrid model:
+    Bootstrap-laag (NIET aanraken; bewezen stabiel sinds Sep 2025):
+        Heartbeat   …30  notify 1 B   proof-of-life + iOS-side watchdog
+        Identity    …33  read   6 B   end0 Ethernet MAC voor pairing
+        SystemInfo  …34  read   JSON  hostname/model/serial/...
 
-This file deliberately lives flat at the repo root and is structured
-section-for-section like the Twilight-Flow / Stepper-Hat reference server
-(github.com/Rick-GO/GOcontroll-Stepper-Hat — Raspberry BT server) which has
-been running stably for months.
+    RPC-laag (UUIDs blijven; payload-betekenis verandert):
+        Request     …31  write       chunked  {id, cmd, params?}
+        Response    …32  notify      chunked  {id, ok, data?} of {event, data}
 
-Service     4E2C7A1B-F3D5-4890-B6C8-2A9E0F7D3C5B
-Heartbeat   4E2C7A30-…   [read, notify]   Pi → iPhone   1 s   1 byte counter
-Control     4E2C7A31-…   [write, w/o-r]   iPhone → Pi   ≥1 s  4 bytes [seq, cmd, arg_lo, arg_hi]
-Telemetry   4E2C7A32-…   [read, notify]   Pi → iPhone   5 s   16 bytes (see _pack_telemetry)
+    Frame format (per BLE write/notify):
+        byte 0 : seq  (0-based, uint8)
+        byte 1 : total (count of frames in this message, uint8 > 0)
+        2..    : utf-8 JSON fragment
+
+    Phase-1 commands (all read-only, no auth):
+        system.stats   → {cpu, temp_c, mem_pct, uptime_s}
+        modules.info   → {slots: [{slot, type, hw_version, fw_version, empty}]}
+        network.info   → {ethernet:{...}, wifi:{...}, wwan:{...}}
+        can.info       → {interfaces:[{id,present,up,kbps}], load:{canX:pct}}
+
+Backwards-compat met oude iOS-app: de OUDE app schrijft 4-byte keepalive naar
+Control en abonneert NIET op Telemetry. Beide cases zijn benign — onze
+RPC-reassembler verwerpt ongeldige frames stilzwijgend en de oude app ziet
+alleen Heartbeat, Identity en SystemInfo (precies zoals nu).
 
 Run:
     sudo /usr/bin/python3 /opt/gocontroll/go-bt/ble_server.py
 """
 
+import json
 import logging
+import os
+import re
 import socket
 import struct
+import subprocess
 import time
 import zlib
+from collections import deque
 from logging.handlers import RotatingFileHandler
 
 import dbus
 import dbus.service
 import dbus.mainloop.glib
 from bluezero import adapter, advertisement, async_tools, constants, peripheral
+from gi.repository import GLib
 
 # ──────────────────────────────────────────────────────────────────────────────
 # UUIDs — kept identical to the Linux mgmt service the iOS app already knows
 # ──────────────────────────────────────────────────────────────────────────────
-SERVICE_UUID    = '4E2C7A1B-F3D5-4890-B6C8-2A9E0F7D3C5B'
-HEARTBEAT_UUID  = '4E2C7A30-F3D5-4890-B6C8-2A9E0F7D3C5B'
-CONTROL_UUID    = '4E2C7A31-F3D5-4890-B6C8-2A9E0F7D3C5B'
-TELEMETRY_UUID  = '4E2C7A32-F3D5-4890-B6C8-2A9E0F7D3C5B'
-IDENTITY_UUID   = '4E2C7A33-F3D5-4890-B6C8-2A9E0F7D3C5B'
+SERVICE_UUID     = '4E2C7A1B-F3D5-4890-B6C8-2A9E0F7D3C5B'
+HEARTBEAT_UUID   = '4E2C7A30-F3D5-4890-B6C8-2A9E0F7D3C5B'
+REQUEST_UUID     = '4E2C7A31-F3D5-4890-B6C8-2A9E0F7D3C5B'   # was CONTROL
+RESPONSE_UUID    = '4E2C7A32-F3D5-4890-B6C8-2A9E0F7D3C5B'   # was TELEMETRY
+IDENTITY_UUID    = '4E2C7A33-F3D5-4890-B6C8-2A9E0F7D3C5B'
+SYSTEM_INFO_UUID = '4E2C7A34-F3D5-4890-B6C8-2A9E0F7D3C5B'
 
 HEARTBEAT_INTERVAL_MS = 1000
-TELEMETRY_INTERVAL_S  = 5
-WATCHDOG_TIMEOUT_S    = 2.0
+WATCHDOG_TIMEOUT_S    = 5.0   # iOS heartbeat-write watchdog (informational)
+
+# RPC chunk size — chosen well below the smallest MTU iOS will negotiate
+# (185 = effective 182 ATT payload; minus 2 header bytes leaves 180).
+# Spreid frames met TX_INTERVAL_MS tussen elke notify zodat BlueZ ze als
+# losse PropertiesChanged signals door kan zetten.
+RPC_MAX_PAYLOAD = 180
+RPC_TX_INTERVAL_MS = 15
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Advertising intervals (milliseconds, per the BlueZ LEAdvertisement1 spec).
@@ -62,6 +86,19 @@ ADV_MAX_INTERVAL_MS = 100
 AGENT_PATH       = '/com/gocontroll/agent'
 AGENT_CAPABILITY = 'NoInputNoOutput'
 
+# Manufacturer Specific Data — 16-bit company ID, payload broadcast in scan
+# response. 0xFFFF is the BLE SIG "test/proprietary" range; safe for our use
+# until we register an official company ID. The payload is intentionally
+# compact so it fits next to the 128-bit Service UUID without crowding the
+# primary advertising packet (BlueZ moves it into the scan response).
+#
+#   payload[0]   version    uint8   currently 0x01
+#   payload[1]   model      uint8   1=L4, 2=M1, 3=HMI1, 0=unknown
+#   payload[2]   serial_len uint8   N in bytes (≤ 28 to keep the ad legal)
+#   payload[3..] serial     ASCII   `go-sn r` output (e.g. "B1AL-B055-B001-A002")
+MFG_COMPANY_ID    = 0xFFFF
+MFG_PAYLOAD_VERSION = 0x01
+
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -69,14 +106,37 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────────────
 _heartbeat_counter: int = 0
 _heartbeat_char = None
-_telemetry_char = None
+_response_char = None      # the …32 characteristic — RPC notify channel
 
 _last_control_ts: float = 0.0
 _session_active:  bool  = False
 
-# Cached telemetry inputs (refreshed once per telemetry tick)
+# Cached telemetry inputs (kept for system.stats handler)
 _cpu_prev_idle:  int = 0
 _cpu_prev_total: int = 0
+
+# CAN busload differential state (per-iface deltas across system.stats / can.info)
+_can_load_state: dict = {}     # ifc -> {"t": monotonic, "p": packets, "b": bytes}
+_can_bitrate_cache: dict = {}  # ifc -> (cached_at_monotonic, bitrate_bps)
+_CAN_BITRATE_TTL_S = 30.0
+
+# RPC reassembly state (server-side rx) — frames van de iPhone
+_rx_buf:   bytearray = bytearray()
+_rx_total: int = 0
+_rx_seq:   int = 0   # last seq received (-1 means waiting for seq=0)
+
+# RPC tx queue — frames die naar de iPhone moeten. Eén GLib idle pump verstuurt
+# één frame per RPC_TX_INTERVAL_MS; dat geeft BlueZ tijd om elke set_value als
+# een losse PropertiesChanged signal door te zetten.
+_tx_queue: deque = deque()
+_tx_pumping: bool = False
+
+# Reference naar de bluezero Peripheral, gezet in main() zodat on_disconnect
+# de LEAdvertisement1 instance opnieuw kan registreren. Op de Murata 1YN-chip
+# in de M1 dropt de controller de adv-instance na een central-disconnect en
+# hervat 'm niet automatisch — zonder re-register is het apparaat na de
+# eerste connect-cycle "verdwenen" voor latere scans tot de service herstart.
+_peripheral = None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -223,32 +283,189 @@ def cb_heartbeat_notify(notifying: bool, characteristic) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Control — iPhone → Pi, write / write-without-response, 4 bytes
-#   Byte 0   seq      uint8   monotonic per-session sequence number
-#   Byte 1   cmd      uint8   reserved for stage 2; ignored in stage 1
-#   Bytes 2-3 arg     uint16  little-endian, reserved for stage 2
-#
-# Every successful write resets the watchdog. The first write of a session
-# also flips _session_active = True so the watchdog starts arming.
+# RPC — chunked JSON over Request (write) + Response (notify)
 # ──────────────────────────────────────────────────────────────────────────────
-def cb_control_write(value, options) -> None:
-    global _last_control_ts, _session_active
+#
+# Wire frame (per BLE write or notify):
+#   byte 0 : seq   (0-based, uint8)
+#   byte 1 : total (>0, uint8)
+#   2..    : utf-8 JSON fragment
+#
+# Een complete bericht is de concatenatie van `total` opeenvolgende frames.
+# Server stuurt één bericht volledig voordat het volgende begint (atomic),
+# zodat iOS' assembler nooit chunks van twee berichten hoeft te multiplexen.
+#
+# Envelope (na herassemblage):
+#   request : {"id": <int>, "cmd": "<ns>.<verb>", "params": {...optional...}}
+#   response: {"id": <int>, "ok": true,  "data": {...}}
+#             {"id": <int>, "ok": false, "error": "<msg>"}
+#   event   : {"event": "<name>", "data": {...}}     # geen id — push only
+#
+# De `id` is door de client gekozen en uniek genoeg (uint32 wraparound is OK
+# zolang er nooit twee in-flight zijn met dezelfde id; iOS-kant garandeert dit).
+
+def _reset_rx() -> None:
+    global _rx_buf, _rx_total, _rx_seq
+    _rx_buf = bytearray()
+    _rx_total = 0
+    _rx_seq = 0
+
+
+def cb_request_write(value, options) -> None:
+    """RPC request frame uit iOS — herassembleer en dispatch zodra compleet."""
+    global _last_control_ts, _session_active, _rx_buf, _rx_total, _rx_seq
     raw = bytes(value)
-    if len(raw) < 4:
-        logger.warning('Control: short packet (%d bytes), ignored', len(raw))
+    if len(raw) < 2:
         return
     seq = raw[0]
-    cmd = raw[1]
-    arg = struct.unpack_from('<H', raw, 2)[0]
+    total = raw[1]
+    payload = raw[2:]
+
+    # Heartbeat: een geldig RPC-frame telt ook als levensteken.
     _last_control_ts = time.monotonic()
     if not _session_active:
-        logger.info('Control: session opened (first write)')
+        logger.info('RPC: session opened (first request frame)')
         _session_active = True
-    logger.info('Control: seq=%d cmd=%d arg=%d', seq, cmd, arg)
+
+    if total == 0:
+        return
+
+    if seq == 0:
+        _rx_buf = bytearray(payload)
+        _rx_total = total
+        _rx_seq = 0
+    elif seq == _rx_seq + 1 and total == _rx_total:
+        _rx_buf.extend(payload)
+        _rx_seq = seq
+    else:
+        # Out-of-order of stale fragment — discard alles, wacht op nieuw seq=0.
+        logger.warning('RPC: dropped frame (seq=%d total=%d, expected next=%d/%d)',
+                       seq, total, _rx_seq + 1, _rx_total)
+        _reset_rx()
+        return
+
+    if _rx_seq != _rx_total - 1:
+        return  # nog niet compleet
+
+    raw_json = bytes(_rx_buf)
+    _reset_rx()
+    try:
+        req = json.loads(raw_json.decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        logger.warning('RPC: bad request JSON (%d B): %s', len(raw_json), exc)
+        return
+
+    if not isinstance(req, dict):
+        logger.warning('RPC: request not an object: %r', req)
+        return
+
+    req_id = req.get('id')
+    cmd = req.get('cmd')
+    params = req.get('params') or {}
+    if not isinstance(cmd, str):
+        logger.warning('RPC: missing/invalid cmd in request id=%r', req_id)
+        return
+
+    logger.info('RPC ← id=%s cmd=%s params=%s', req_id, cmd, params)
+    _dispatch_request(req_id, cmd, params)
+
+
+def _dispatch_request(req_id, cmd: str, params: dict) -> None:
+    handler = _HANDLERS.get(cmd)
+    if handler is None:
+        _send_response(req_id, ok=False, error=f'unknown cmd: {cmd}')
+        return
+    try:
+        data = handler(params)
+        _send_response(req_id, ok=True, data=data)
+    except Exception as exc:
+        logger.exception('RPC: handler %s raised', cmd)
+        _send_response(req_id, ok=False, error=f'{type(exc).__name__}: {exc}')
+
+
+def _send_response(req_id, ok: bool, data=None, error: str = None) -> None:
+    msg = {'id': req_id, 'ok': bool(ok)}
+    if ok and data is not None:
+        msg['data'] = data
+    if not ok and error is not None:
+        msg['error'] = error
+    _enqueue_tx(msg)
+
+
+def _send_event(event: str, data=None) -> None:
+    msg = {'event': event}
+    if data is not None:
+        msg['data'] = data
+    _enqueue_tx(msg)
+
+
+def _enqueue_tx(obj) -> None:
+    try:
+        raw = json.dumps(obj, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+    except (TypeError, ValueError) as exc:
+        logger.exception('RPC: cannot serialise outbound message: %s', exc)
+        return
+
+    n = len(raw)
+    chunks = [raw[i:i + RPC_MAX_PAYLOAD] for i in range(0, n, RPC_MAX_PAYLOAD)] or [b'']
+    total = len(chunks)
+    if total > 255:
+        logger.error('RPC: response too large (%d B → %d chunks); dropping', n, total)
+        return
+
+    label = obj.get('event') or f"id={obj.get('id')}"
+    logger.info('RPC → %s ok=%s bytes=%d chunks=%d',
+                label, obj.get('ok', '-'), n, total)
+
+    for seq, chunk in enumerate(chunks):
+        _tx_queue.append((seq, total, chunk))
+    _kick_tx_pump()
+
+
+def _kick_tx_pump() -> None:
+    global _tx_pumping
+    if _tx_pumping or not _tx_queue:
+        return
+    _tx_pumping = True
+    GLib.idle_add(_pump_tx_once)
+
+
+def _pump_tx_once() -> bool:
+    """Stuur één frame en plan het volgende met een korte spacer."""
+    global _tx_pumping
+    if not _tx_queue:
+        _tx_pumping = False
+        return False  # remove
+
+    if _response_char is None or not _response_char.is_notifying:
+        # Geen subscriber — laat berichten vervallen i.p.v. eindeloos te bufferen.
+        dropped = len(_tx_queue)
+        _tx_queue.clear()
+        _tx_pumping = False
+        if dropped:
+            logger.info('RPC: response char not notifying — dropped %d queued frames',
+                        dropped)
+        return False
+
+    seq, total, chunk = _tx_queue.popleft()
+    frame = bytes([seq, total]) + chunk
+    try:
+        _response_char.set_value(list(frame))
+    except Exception as exc:
+        logger.warning('RPC: notify set_value failed (seq=%d/%d): %s',
+                       seq, total, exc)
+
+    if _tx_queue:
+        GLib.timeout_add(RPC_TX_INTERVAL_MS, _pump_tx_once)
+    else:
+        _tx_pumping = False
+    return False  # always one-shot; reschedule via timeout/idle above
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Watchdog — 1 Hz; logs once when the iPhone heartbeat times out.
+# Watchdog — 1 Hz; logs once when the iPhone heartbeat / RPC traffic stops.
+# Phase-1 effect: alleen log + close session marker. Volgende fases kunnen
+# RPC-state opruimen en een central-disconnect forceren.
 # ──────────────────────────────────────────────────────────────────────────────
 def _watchdog() -> bool:
     global _session_active
@@ -256,38 +473,41 @@ def _watchdog() -> bool:
         return True
     elapsed = time.monotonic() - _last_control_ts
     if elapsed > WATCHDOG_TIMEOUT_S:
-        logger.warning('Watchdog: no Control write for %.1fs — session lost', elapsed)
+        logger.warning('Watchdog: no Request write for %.1fs — session lost', elapsed)
         _session_active = False
+        _reset_rx()
     return True
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Telemetry — Pi → iPhone, 5 s, fixed 16-byte struct (little-endian)
-#   B   model           1=L4 2=M1 3=HMI1 0=unknown
-#   I   hostname_hash   crc32 of socket.gethostname()
-#   I   uptime_s        seconds since boot
-#   B   cpu_pct         0..100
-#   B   mem_pct         0..100
-#   B   eth_up          0/1
-#   b   wifi_rssi       dBm, signed (-127..0); 0 means "no Wi-Fi"
-#   xxx reserved        3 bytes (set to 0)
+# Data-collection helpers — gedeeld tussen system.stats / network.info / can.info
 # ──────────────────────────────────────────────────────────────────────────────
-_MODEL_TO_BYTE = {'l4': 1, 'm1': 2, 'hmi1': 3}
+_MODEL_TO_BYTE = {'L4': 1, 'M1': 2, 'HMI1': 3}
 
 
-def _detect_model_byte() -> int:
-    """Best-effort controller-model detection from the device tree."""
+def _detect_model_name() -> str:
+    """Return the canonical short model name (M1 / L4 / HMI1) extracted from
+    the device-tree platform string, or an empty string if not detected.
+
+    Token-based matching — substring matching is a trap: "M1" appears inside
+    "HMI1", so an `'m1' in raw` check would mis-identify an HMI1 as M1.
+    """
     for path in ('/sys/firmware/devicetree/base/platform',
                  '/sys/firmware/devicetree/base/model'):
         try:
             with open(path, 'rb') as fh:
-                raw = fh.read().decode('ascii', errors='ignore').strip('\x00').lower()
-            for key, val in _MODEL_TO_BYTE.items():
-                if key in raw:
-                    return val
+                raw = fh.read().decode('ascii', errors='ignore').strip('\x00 \t\n\r')
+            for token in raw.upper().split():
+                if token in _MODEL_TO_BYTE:
+                    return token
         except OSError:
             continue
-    return 0
+    return ''
+
+
+def _detect_model_byte() -> int:
+    """Stage-1 telemetry encoding: 0=unknown, 1=L4, 2=M1, 3=HMI1."""
+    return _MODEL_TO_BYTE.get(_detect_model_name(), 0)
 
 
 def _read_uptime_s() -> int:
@@ -361,34 +581,95 @@ def _read_wifi_rssi() -> int:
     return 0
 
 
-def _pack_telemetry() -> list:
-    payload = struct.pack(
-        '<BIIBBBbxxx',
-        _detect_model_byte(),
-        zlib.crc32(socket.gethostname().encode('utf-8')) & 0xFFFFFFFF,
-        _read_uptime_s() & 0xFFFFFFFF,
-        _read_cpu_pct(),
-        _read_mem_pct(),
-        _read_eth_up(),
-        _read_wifi_rssi(),
-    )
-    return list(payload)
+def _build_mfg_payload() -> bytes:
+    """Compact identification blob — fixed 6-byte layout to fit the legacy
+    31-byte BLE advertising packet alongside our 128-bit Service UUID.
+
+    Layout:
+        byte 0      version       UInt8 — currently 0x01
+        byte 1      model         UInt8 — 1=L4, 2=M1, 3=HMI1, 0=unknown
+        bytes 2..5  serial_tail   ASCII — last 4 chars of `go-sn r`,
+                                   left-padded with 0x00 if shorter
+
+    Why only the tail: BlueZ 5.82 on the Broadcom chip rejects
+    "Add Extended Advertising Parameters" with Invalid Parameters (0x0d) the
+    moment the AD set exceeds 31 B, which silently kills advertising. Full
+    serial fits comfortably in the SystemInfo characteristic post-connect;
+    pre-connect we only need enough to disambiguate a fleet on the bench.
+    """
+    model_byte = _detect_model_byte()
+    serial = _run_capture(['go-sn', 'r']).strip()
+    serial_bytes = serial.encode('ascii', errors='ignore')
+    if len(serial_bytes) >= 4:
+        tail = serial_bytes[-4:]
+    else:
+        tail = b'\x00' * (4 - len(serial_bytes)) + serial_bytes
+    payload = bytearray()
+    payload.append(MFG_PAYLOAD_VERSION)
+    payload.append(model_byte)
+    payload.extend(tail)
+    return bytes(payload)
 
 
-def _telemetry_tick() -> bool:
-    if _telemetry_char is not None and _telemetry_char.is_notifying:
-        _telemetry_char.set_value(_pack_telemetry())
-    return True
+def _read_temp_c() -> "float | None":
+    """CPU/SoC temperatuur in °C uit het eerste leesbare thermal_zone."""
+    try:
+        zones = sorted(p for p in os.listdir('/sys/class/thermal')
+                       if p.startswith('thermal_zone'))
+    except OSError:
+        return None
+    for zone in zones:
+        try:
+            with open(f'/sys/class/thermal/{zone}/temp', 'r') as fh:
+                milli = int(fh.read().strip())
+            if milli > 0:
+                return round(milli / 1000.0, 1)
+        except (OSError, ValueError):
+            continue
+    return None
 
 
-def cb_telemetry_read():
-    return _pack_telemetry()
+# ──────────────────────────────────────────────────────────────────────────────
+# Response characteristic — Pi → iPhone, RPC notify channel.
+# Geen periodieke push in fase 1; alle traffic is request-driven.
+# ──────────────────────────────────────────────────────────────────────────────
+def cb_response_read(options=None):
+    """ATT Read voor RESPONSE: leveren een lege payload op. iOS leest dit nooit
+    — alle berichten komen via Notify — maar BlueZ vereist een read_callback
+    voor characteristics die [read, notify] flags hebben. We accepteren
+    `options` zodat bluezero ook een eventuele BLOB-read keurig dispatched."""
+    return []
 
 
-def cb_telemetry_notify(notifying: bool, characteristic) -> None:
-    global _telemetry_char
-    _telemetry_char = characteristic
-    logger.info('Telemetry notifications %s', 'ON' if notifying else 'OFF')
+def _read_offset(options) -> int:
+    """Extract the `offset` integer from a BlueZ ReadValue options dict.
+    bluezero converts D-Bus types to plain Python before invoking us, so the
+    dict (when present) is straight `{'offset': int, 'mtu': int, ...}`. Always
+    returns a non-negative int; falls back to 0 on missing/invalid input."""
+    if not options:
+        return 0
+    raw = options.get('offset')
+    if raw is None:
+        return 0
+    try:
+        v = int(raw)
+        return v if v >= 0 else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def cb_response_notify(notifying: bool, characteristic) -> None:
+    global _response_char
+    _response_char = characteristic
+    logger.info('Response notifications %s', 'ON' if notifying else 'OFF')
+    if not notifying:
+        # Geen subscriber meer — gooi pending tx-frames weg zodat ze niet later
+        # de eerste response van een nieuwe sessie corrumperen.
+        if _tx_queue:
+            logger.info('RPC: notify OFF — dropping %d queued tx frames',
+                        len(_tx_queue))
+            _tx_queue.clear()
+        _reset_rx()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -412,8 +693,751 @@ def _read_identity_mac() -> bytes:
     return bytes(6)
 
 
-def cb_identity_read():
-    return list(_read_identity_mac())
+def cb_identity_read(options=None):
+    """6 bytes — passes in one MTU. Honour `options['offset']` for safety
+    even though iOS will never need a BLOB read here."""
+    mac = _read_identity_mac()
+    offset = _read_offset(options)
+    chunk = mac[offset:]
+    if offset == 0:
+        logger.info('Identity read → %s', mac.hex(':'))
+    else:
+        logger.info('Identity read offset=%d → %d B', offset, len(chunk))
+    return list(chunk)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SystemInfo — Pi → iPhone, read-only, JSON. Mirrors the canonical sources
+# go-web-ui already exposes over its /api/get_* HTTP endpoints, so the BLE
+# client and the local web UI render the same fields from the same files.
+#
+# Sources:
+#   model        device-tree /platform token (M1 / L4 / HMI1)
+#   hostname     socket.gethostname()
+#   hw_revision  /sys/firmware/devicetree/base/hardware
+#   kernel       `uname -rs`
+#   rootfs       /etc/image-info — composed display string
+#   serial       `go-sn r`
+#
+# Plain Read (no notify) — these fields are static for the lifetime of the
+# session, so a single ATT Read post-discovery is enough. iOS / BlueZ handle
+# ATT_READ_BLOB chunking transparently if the JSON exceeds the negotiated MTU.
+# ──────────────────────────────────────────────────────────────────────────────
+def _read_text_file(path: str) -> str:
+    try:
+        with open(path, 'r') as fh:
+            return fh.read().strip('\x00 \t\n\r')
+    except OSError:
+        return ''
+
+
+def _read_image_info() -> dict:
+    """Parse /etc/image-info (shell-style KEY="VALUE" lines)."""
+    info = {}
+    try:
+        with open('/etc/image-info', 'r') as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                key, _, val = line.partition('=')
+                info[key.strip()] = val.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return info
+
+
+def _run_capture(cmd: list, timeout: float = 2.0) -> str:
+    """Run a short subprocess and return stripped stdout, or '' on any failure."""
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=True,
+            text=True,
+        )
+        return result.stdout.strip()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            FileNotFoundError, OSError):
+        return ''
+
+
+_DEBIAN_CODENAMES = {
+    'sid', 'trixie', 'bookworm', 'bullseye', 'buster', 'stretch', 'jessie',
+}
+_ARCH_DISPLAY = {
+    'arm64': 'ARM 64',
+    'armhf': 'ARM HF',
+    'armel': 'ARM EL',
+    'amd64': 'AMD 64',
+    'i386':  'i386',
+}
+
+
+def _build_rootfs_summary() -> str:
+    """Human-readable rootfs label derived from /etc/image-info IMAGE_ROOTFS.
+
+    Examples:
+        'trixie-arm64'   → 'Debian Trixie ARM 64'
+        'bookworm-arm64' → 'Debian Bookworm ARM 64'
+        'foo-bar'        → 'foo-bar'   (raw fallback for unknown codenames)
+
+    Drops the IMAGE_VARIANT and IMAGE_BUILD_SHA fields the iOS app used to
+    show — those weren't useful in the user-facing Overview tab.
+    """
+    name = _read_image_info().get('IMAGE_ROOTFS', '').strip()
+    if not name:
+        return ''
+    codename, _, arch = name.partition('-')
+    if codename.lower() not in _DEBIAN_CODENAMES:
+        return name
+    arch_disp = _ARCH_DISPLAY.get(arch.lower(), arch.upper())
+    return f'Debian {codename.capitalize()} {arch_disp}'.strip()
+
+
+def _read_system_info_json() -> bytes:
+    payload = {
+        'model':         _detect_model_name() or 'unknown',
+        'hostname':      socket.gethostname(),
+        'hw_revision':   _read_text_file('/sys/firmware/devicetree/base/hardware'),
+        'kernel':        _run_capture(['uname', '-rs']),
+        'rootfs':        _build_rootfs_summary(),
+        'serial_number': _run_capture(['go-sn', 'r']),
+    }
+    return json.dumps(payload).encode('utf-8')
+
+
+def cb_system_info_read(options=None):
+    """Returns the JSON sliced from `options['offset']` so iOS' long-read flow
+    (ATT_READ_BLOB) gets correct data. Without slicing, every BLOB request
+    re-reads bytes 0..N which corrupts the assembled value on the central."""
+    js = _read_system_info_json()
+    offset = _read_offset(options)
+    chunk = js[offset:]
+    if offset == 0:
+        logger.info('SystemInfo read → %d B: %s', len(js), js.decode('utf-8', errors='replace'))
+    else:
+        logger.info('SystemInfo read offset=%d → %d B', offset, len(chunk))
+    return list(chunk)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# RPC handlers — fase 1 (alleen reads). Elke handler krijgt het params-dict
+# (mag {} zijn) en levert het `data`-veld van de respons. Exceptions worden
+# opgevangen door de dispatcher en als {ok:false, error:...} doorgestuurd.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _run_capture_argv(argv: list, timeout: float = 3.0) -> str:
+    """Compat-wrapper: gebruik bestaande _run_capture maar accepteer argv-list."""
+    return _run_capture(argv, timeout=timeout)
+
+
+# --- modules.info ------------------------------------------------------------
+
+_MODULES_JSON_PATH = '/lib/firmware/gocontroll/modules.json'
+
+def _parse_module_firmware(fw_str: str) -> "dict | None":
+    """Parse '20-20-2-6-2-2-0' → dict {type, hw_version, fw_version}.
+
+    Format (per identify v2.2.3):
+      tokens[0] = manufacturer prefix (altijd 20)
+      tokens[1] = type group (10=input, 20=output, 30=comm, 40=ANLEG)
+      tokens[2] = type id within group
+      tokens[3] = HW minor (HW major altijd 1)
+      tokens[4..6] = SW major.minor.patch
+
+    iOS' BLEManager.moduleName(for:) doet `articleNumber / 100` en zoekt op de
+    6-digit base (e.g. 202002). De wire-encoding is daarom de 8-cijferige
+    samenvoeging article*100+hw → "20200206" → /100 = 202002 → "6 Channel
+    Output Module" in de iOS-lookup.
+    """
+    if not fw_str:
+        return None
+    parts = fw_str.split('-')
+    if len(parts) < 7:
+        return None
+    try:
+        mfr        = int(parts[0])
+        type_group = int(parts[1])
+        type_id    = int(parts[2])
+        hw_minor   = int(parts[3])
+        sw_major   = int(parts[4])
+        sw_minor   = int(parts[5])
+        sw_patch   = int(parts[6])
+    except ValueError:
+        return None
+    article = mfr * 10000 + type_group * 100 + type_id   # bv. 20*10000+20*100+2 = 202002
+    type_field = f'{article * 100 + hw_minor:08d}'        # "20200206"
+    return {
+        'type': type_field,
+        'hw_version': f'v1.{hw_minor}',
+        'fw_version': f'{sw_major}.{sw_minor}.{sw_patch}',
+    }
+
+
+def _handler_modules_info(_params: dict) -> dict:
+    try:
+        with open(_MODULES_JSON_PATH, 'r') as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return {'slots': []}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f'cannot read modules.json: {exc}')
+
+    slots = []
+    if isinstance(raw, list):
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            slot = entry.get('slot')
+            if not isinstance(slot, int) or slot < 1:
+                continue
+            fw_str = entry.get('firmware', '') or ''
+            parsed = _parse_module_firmware(fw_str)
+            if parsed is None:
+                slots.append({'slot': slot, 'empty': True})
+            else:
+                slots.append({
+                    'slot': slot,
+                    'type': parsed['type'],
+                    'hw_version': parsed['hw_version'],
+                    'fw_version': parsed['fw_version'],
+                    'empty': False,
+                })
+    slots.sort(key=lambda s: s['slot'])
+    return {'slots': slots}
+
+
+# --- system.stats ------------------------------------------------------------
+
+def _handler_system_stats(_params: dict) -> dict:
+    return {
+        'cpu':       _read_cpu_pct(),
+        'temp_c':    _read_temp_c(),
+        'mem_pct':   _read_mem_pct(),
+        'uptime_s':  _read_uptime_s(),
+    }
+
+
+# --- network.info ------------------------------------------------------------
+
+def _read_iface_ip(iface: str) -> "str | None":
+    """Eerste IPv4 op interface, via `ip -j -4 addr show`."""
+    out = _run_capture(['ip', '-j', '-4', 'addr', 'show', iface], timeout=2.0)
+    if not out:
+        return None
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, list) or not data:
+        return None
+    addrs = data[0].get('addr_info') or []
+    for a in addrs:
+        if a.get('family') == 'inet' and a.get('local'):
+            return a['local']
+    return None
+
+
+def _read_iface_mac(iface: str) -> "str | None":
+    try:
+        with open(f'/sys/class/net/{iface}/address', 'r') as fh:
+            mac = fh.read().strip()
+        return mac or None
+    except OSError:
+        return None
+
+
+def _read_iface_operstate(iface: str) -> str:
+    try:
+        with open(f'/sys/class/net/{iface}/operstate', 'r') as fh:
+            return fh.read().strip()
+    except OSError:
+        return 'unknown'
+
+
+def _ethernet_info() -> dict:
+    iface = 'end0' if os.path.exists('/sys/class/net/end0') else 'eth0'
+    operstate = _read_iface_operstate(iface)
+    info = {
+        'iface':       iface,
+        'mac':         _read_iface_mac(iface),
+        'connected':   operstate == 'up',
+        'current_ip':  _read_iface_ip(iface),
+        'static_ip':   None,
+        'mode':        None,
+    }
+    # nmcli connection-mode (auto vs static) — best effort
+    out = _run_capture(['nmcli', '-t', '-f', 'NAME,DEVICE,STATE',
+                        'con', 'show', '--active'], timeout=2.0)
+    if out:
+        for line in out.splitlines():
+            cols = line.split(':')
+            if len(cols) >= 2 and (cols[1] == iface or cols[1] == 'eth0'):
+                name = cols[0].lower()
+                if 'static' in name:
+                    info['mode'] = 'static'
+                elif 'auto' in name:
+                    info['mode'] = 'auto'
+                break
+    # static IP profielwaarde (alleen tonen wanneer profiel bestaat)
+    sout = _run_capture(['nmcli', '-t', '-f', 'ipv4.addresses',
+                         'con', 'show', 'Wired connection static'], timeout=2.0)
+    if sout:
+        for line in sout.splitlines():
+            if line.startswith('ipv4.addresses:'):
+                val = line.split(':', 1)[1].strip()
+                if val:
+                    info['static_ip'] = val.split('/')[0]
+                break
+    return info
+
+
+def _wifi_info() -> dict:
+    info = {
+        'enabled':         False,
+        'mode':            'off',
+        'connected':       False,
+        'ip':              None,
+        'ap_ssid':         None,
+        'connected_ssid':  None,
+    }
+    out = _run_capture(['rfkill', '-J', '--output-all'], timeout=2.0)
+    if out:
+        try:
+            data = json.loads(out)
+            for dev in data.get('rfkilldevices', []):
+                if dev.get('type') == 'wlan':
+                    info['enabled'] = (dev.get('soft') == 'unblocked'
+                                       and dev.get('hard') == 'unblocked')
+                    break
+        except json.JSONDecodeError:
+            pass
+
+    if not info['enabled']:
+        return info
+
+    # Actieve wifi-connectie?
+    cout = _run_capture(['nmcli', '-t', '-f', 'NAME,DEVICE,TYPE,STATE',
+                         'con', 'show', '--active'], timeout=2.0)
+    if cout:
+        for line in cout.splitlines():
+            cols = line.split(':')
+            if len(cols) >= 4 and cols[2].endswith('wireless'):
+                ssid = cols[0]
+                if ssid == 'GOcontroll-AP':
+                    info['mode'] = 'ap'
+                    info['ap_ssid'] = ssid
+                else:
+                    info['mode'] = 'client'
+                    info['connected'] = True
+                    info['connected_ssid'] = ssid
+                dev = cols[1]
+                if dev:
+                    info['ip'] = _read_iface_ip(dev)
+                break
+    if info['mode'] == 'off':
+        # Wifi aan, maar geen connectie — toch het wlan IP melden als er een is
+        info['mode'] = 'client'
+        for dev in ('wlan0', 'wlp0s1'):
+            if os.path.exists(f'/sys/class/net/{dev}'):
+                info['ip'] = _read_iface_ip(dev)
+                break
+    return info
+
+
+def _wwan_info() -> dict:
+    info = {
+        'enabled':         False,
+        'service_state':   'off',
+        'imei':            None,
+        'iccid':           None,
+        'operator':        None,
+        'ip':              None,
+        'apn':             None,
+        'model':           None,
+        'signal_pct':      None,
+    }
+    # Service-status — als go-wwan inactief is, hoef je mmcli niet te bevragen.
+    state = _run_capture(['systemctl', 'is-active', 'go-wwan'], timeout=2.0)
+    info['enabled'] = (state == 'active')
+    if not info['enabled']:
+        return info
+
+    ml = _run_capture(['mmcli', '-J', '--list-modems'], timeout=3.0)
+    if not ml:
+        info['service_state'] = 'searching'
+        return info
+    try:
+        modems = json.loads(ml).get('modem-list', [])
+    except json.JSONDecodeError:
+        modems = []
+    if not modems:
+        info['service_state'] = 'searching'
+        return info
+
+    mout = _run_capture(['mmcli', '-J', '--modem=' + modems[0]], timeout=3.0)
+    if not mout:
+        return info
+    try:
+        m = json.loads(mout).get('modem', {}) or {}
+    except json.JSONDecodeError:
+        return info
+    gen = m.get('generic', {}) or {}
+    three = m.get('3gpp', {}) or {}
+    sq = gen.get('signal-quality', {}) or {}
+
+    def _clean(v):
+        if v is None:
+            return None
+        s = str(v).strip()
+        return None if s in ('', '--') else s
+
+    info['model']         = _clean(gen.get('model'))
+    info['service_state'] = _clean(gen.get('state')) or 'off'
+    info['imei']          = _clean(three.get('imei'))
+    info['operator']      = _clean(three.get('operator-name'))
+    sig = sq.get('value') if isinstance(sq, dict) else sq
+    if sig is not None:
+        try:
+            info['signal_pct'] = int(float(sig))
+        except (TypeError, ValueError):
+            pass
+
+    # SIM ICCID
+    sim_path = _clean(gen.get('sim'))
+    if sim_path:
+        sout = _run_capture(['mmcli', '-J', '-i', sim_path], timeout=3.0)
+        if sout:
+            try:
+                sprops = json.loads(sout).get('sim', {}).get('properties', {}) or {}
+                info['iccid'] = _clean(sprops.get('iccid'))
+            except json.JSONDecodeError:
+                pass
+
+    # Bearer (APN, IPv4)
+    bearers = gen.get('bearers', []) or []
+    if bearers:
+        bout = _run_capture(['mmcli', '-J', '-b', bearers[0]], timeout=3.0)
+        if bout:
+            try:
+                b = json.loads(bout).get('bearer', {}) or {}
+                bprops = b.get('properties', {}) or {}
+                info['apn'] = _clean(bprops.get('apn'))
+                v4 = b.get('ipv4-config', {}) or {}
+                info['ip'] = _clean(v4.get('address'))
+            except json.JSONDecodeError:
+                pass
+    return info
+
+
+def _handler_network_info(_params: dict) -> dict:
+    return {
+        'ethernet': _ethernet_info(),
+        'wifi':     _wifi_info(),
+        'wwan':     _wwan_info(),
+    }
+
+
+# --- can.info ----------------------------------------------------------------
+
+def _list_can_ifaces() -> list:
+    try:
+        return sorted(
+            ifc for ifc in os.listdir('/sys/class/net')
+            if ifc.startswith('can') and os.path.isdir(f'/sys/class/net/{ifc}/statistics')
+        )
+    except OSError:
+        return []
+
+
+def _ip_link_bitrate(ifc: str) -> int:
+    out = _run_capture(['ip', '-j', '-d', 'link', 'show', ifc], timeout=2.0)
+    if not out:
+        return 0
+    try:
+        data = json.loads(out)
+        return int(data[0]['linkinfo']['info_data']['bittiming']['bitrate'])
+    except (json.JSONDecodeError, KeyError, IndexError, ValueError, TypeError):
+        return 0
+
+
+def _bitrate_for(ifc: str) -> int:
+    now = time.monotonic()
+    cached = _can_bitrate_cache.get(ifc)
+    if cached and (now - cached[0]) < _CAN_BITRATE_TTL_S:
+        return cached[1]
+    bitrate = _ip_link_bitrate(ifc)
+    _can_bitrate_cache[ifc] = (now, bitrate)
+    return bitrate
+
+
+def _can_counters(ifc: str) -> tuple:
+    base = f'/sys/class/net/{ifc}/statistics'
+    def _ri(p):
+        try:
+            with open(p, 'r') as fh:
+                return int(fh.read().strip())
+        except (OSError, ValueError):
+            return 0
+    p = _ri(f'{base}/rx_packets') + _ri(f'{base}/tx_packets')
+    b = _ri(f'{base}/rx_bytes')   + _ri(f'{base}/tx_bytes')
+    return p, b
+
+
+def _handler_can_info(_params: dict) -> dict:
+    ifaces_out = []
+    load = {}
+    now = time.monotonic()
+    for ifc in _list_can_ifaces():
+        # Identifier — laatste cijfer(s) van de iface-naam (can0, can1, …)
+        m = re.match(r'^can(\d+)$', ifc)
+        ident = int(m.group(1)) if m else 0
+
+        operstate = _read_iface_operstate(ifc)
+        kbps = _bitrate_for(ifc)
+        ifaces_out.append({
+            'id':       ident,
+            'name':     ifc,
+            'present':  True,
+            'up':       operstate == 'up',
+            'kbps':     int(kbps / 1000) if kbps > 0 else None,
+        })
+
+        # Busload — delta sinds vorige call. Eerste call seedt en geeft 0.
+        p, b = _can_counters(ifc)
+        prev = _can_load_state.get(ifc)
+        pct = 0.0
+        if prev is not None:
+            dt = now - prev['t']
+            dp = max(0, p - prev['p'])
+            db = max(0, b - prev['b'])
+            if dt > 0 and kbps > 0:
+                bits = dp * 47 + db * 8   # CAN classic frame overhead approx
+                pct = max(0.0, min(100.0, (bits / dt) / kbps * 100.0))
+        _can_load_state[ifc] = {'t': now, 'p': p, 'b': b}
+        load[ifc] = round(pct, 1)
+
+    return {'interfaces': ifaces_out, 'load': load}
+
+
+# --- services.list / services.set --------------------------------------------
+
+# Whitelist mirrors go-web-ui's handlers/service.py — services the user is
+# allowed to start/stop via the controller management UI. We deliberately
+# leave go-bt itself off the list: turning it off would kill our own RPC
+# channel and the iPhone could no longer reach the device to turn it on.
+_SERVICES_WHITELIST = (
+    'ssh',
+    'go-simulink',
+    'nodered',
+    'go-bluetooth',
+    'go-upload-server',
+    'go-auto-shutdown',
+    'gadget-getty@ttyGS0',
+    'getty@ttymxc2',
+    'go-webui',
+)
+
+
+def _systemctl_is_active(unit: str) -> bool:
+    out = _run_capture(['systemctl', 'is-active', unit], timeout=2.0)
+    return out == 'active'
+
+
+def _systemctl_is_enabled(unit: str) -> bool:
+    out = _run_capture(['systemctl', 'is-enabled', unit], timeout=2.0)
+    return out in ('enabled', 'enabled-runtime', 'static', 'alias')
+
+
+def _handler_services_list(_params: dict) -> dict:
+    services = []
+    for unit in _SERVICES_WHITELIST:
+        services.append({
+            'unit':    unit,
+            'active':  _systemctl_is_active(unit),
+            'enabled': _systemctl_is_enabled(unit),
+        })
+    return {'services': services}
+
+
+def _systemctl_run(verb: str, unit: str) -> tuple:
+    """Run `systemctl <verb> <unit>` and return (ok, error_msg).
+    `verb` is restricted by the caller to the safe enable/disable/start/stop set."""
+    try:
+        result = subprocess.run(
+            ['systemctl', verb, unit],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=10, text=True,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f'systemctl {verb} {unit}: timeout'
+    if result.returncode != 0:
+        msg = (result.stderr or result.stdout).strip() or f'exit {result.returncode}'
+        return False, msg
+    return True, ''
+
+
+def _handler_services_set(params: dict) -> dict:
+    unit = params.get('unit')
+    enable = params.get('enable')
+    if not isinstance(unit, str) or unit not in _SERVICES_WHITELIST:
+        raise ValueError(f'unit not in whitelist: {unit!r}')
+    if not isinstance(enable, bool):
+        raise ValueError('`enable` must be true or false')
+
+    if enable:
+        ok, err = _systemctl_run('enable', unit)
+        if not ok:
+            raise RuntimeError(err)
+        ok, err = _systemctl_run('start', unit)
+        if not ok:
+            raise RuntimeError(err)
+    else:
+        ok, err = _systemctl_run('stop', unit)
+        if not ok:
+            raise RuntimeError(err)
+        ok, err = _systemctl_run('disable', unit)
+        if not ok:
+            raise RuntimeError(err)
+
+    return {
+        'unit':    unit,
+        'active':  _systemctl_is_active(unit),
+        'enabled': _systemctl_is_enabled(unit),
+    }
+
+
+# --- wifi.scan / wifi.set_mode / wifi.connect --------------------------------
+
+_WIFI_AP_PROFILE = 'GOcontroll-AP'
+
+
+def _wifi_scan_active() -> list:
+    """Trigger nmcli rescan + return visible SSIDs with signal strength.
+
+    `nmcli -t -f SSID,SIGNAL,SECURITY device wifi list --rescan yes` blocks
+    on the rescan (which is what we want — the user pressed Scan and is
+    waiting). De-duplicate by SSID, keep the strongest signal."""
+    # Best-effort rescan trigger; ignore errors.
+    _run_capture(['nmcli', 'device', 'wifi', 'rescan'], timeout=15.0)
+    out = _run_capture(['nmcli', '-t', '-f', 'SSID,SIGNAL,SECURITY',
+                        'device', 'wifi', 'list'], timeout=10.0)
+    if not out:
+        return []
+    by_ssid = {}
+    for line in out.splitlines():
+        parts = line.split(':')
+        if len(parts) < 2:
+            continue
+        ssid = parts[0]
+        if not ssid:
+            continue
+        try:
+            signal = int(parts[1])
+        except ValueError:
+            signal = 0
+        security = parts[2] if len(parts) >= 3 else ''
+        existing = by_ssid.get(ssid)
+        if existing is None or signal > existing['signal']:
+            by_ssid[ssid] = {
+                'ssid':     ssid,
+                'signal':   signal,
+                'secured':  bool(security and security != '--'),
+                'security': security,
+            }
+    return sorted(by_ssid.values(), key=lambda e: -e['signal'])
+
+
+def _handler_wifi_scan(_params: dict) -> dict:
+    return {'networks': _wifi_scan_active()}
+
+
+def _handler_wifi_set_mode(params: dict) -> dict:
+    """Switch between Access Point and Client. Mirrors go-web-ui's
+    set_wifi_type — toggles the autoconnect flag on the AP profile vs the
+    user's regular wifi connections, then brings the right one up."""
+    mode = params.get('mode')
+    if mode not in ('ap', 'client'):
+        raise ValueError("mode must be 'ap' or 'client'")
+
+    # Discover all wireless connections so we can flip their autoconnect.
+    out = _run_capture(['nmcli', '-t', 'con'], timeout=3.0)
+    wifi_cons = []
+    if out:
+        for line in out.splitlines():
+            cols = line.split(':')
+            if len(cols) >= 3 and cols[2].endswith('wireless') and cols[0] != _WIFI_AP_PROFILE:
+                wifi_cons.append(cols[0])
+
+    if mode == 'ap':
+        for con in wifi_cons:
+            _run_capture(['nmcli', 'con', 'mod', con,
+                          'connection.autoconnect', 'no'], timeout=3.0)
+        _run_capture(['nmcli', 'con', 'mod', _WIFI_AP_PROFILE,
+                      'connection.autoconnect', 'yes'], timeout=3.0)
+        ok, err = _systemctl_run('start', 'NetworkManager')   # no-op if running
+        _run_capture(['nmcli', 'con', 'up', _WIFI_AP_PROFILE], timeout=10.0)
+    else:  # client
+        for con in wifi_cons:
+            _run_capture(['nmcli', 'con', 'mod', con,
+                          'connection.autoconnect', 'yes'], timeout=3.0)
+        _run_capture(['nmcli', 'con', 'mod', _WIFI_AP_PROFILE,
+                      'connection.autoconnect', 'no'], timeout=3.0)
+        _run_capture(['nmcli', 'con', 'down', _WIFI_AP_PROFILE], timeout=5.0)
+
+    return {'mode': mode}
+
+
+def _handler_wifi_connect(params: dict) -> dict:
+    """Connect to a WiFi network as a client. Creates / updates the nmcli
+    connection profile and brings it up. Returns the resolved IP on success."""
+    ssid = params.get('ssid')
+    password = params.get('password', '')
+    if not isinstance(ssid, str) or not ssid:
+        raise ValueError('`ssid` is required')
+    if not isinstance(password, str):
+        raise ValueError('`password` must be a string (use "" for open networks)')
+
+    cmd = ['nmcli', 'device', 'wifi', 'connect', ssid]
+    if password:
+        cmd += ['password', password]
+    try:
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=30, text=True,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f'connect {ssid}: timeout')
+    if result.returncode != 0:
+        msg = (result.stderr or result.stdout).strip() or f'exit {result.returncode}'
+        raise RuntimeError(f'connect {ssid}: {msg}')
+
+    # Probe the wifi info immediately so the iOS-side gets a fresh snapshot
+    # in the same response, instead of waiting for the next refresh tick.
+    info = _wifi_info()
+    return {
+        'ssid':       ssid,
+        'connected':  bool(info.get('connected')),
+        'ip':         info.get('ip'),
+    }
+
+
+# --- handler-tabel -----------------------------------------------------------
+
+_HANDLERS = {
+    'system.stats':   _handler_system_stats,
+    'modules.info':   _handler_modules_info,
+    'network.info':   _handler_network_info,
+    'can.info':       _handler_can_info,
+    'services.list':  _handler_services_list,
+    'services.set':   _handler_services_set,
+    'wifi.scan':      _handler_wifi_scan,
+    'wifi.set_mode':  _handler_wifi_set_mode,
+    'wifi.connect':   _handler_wifi_connect,
+}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -426,7 +1450,40 @@ def on_connect(device) -> None:
 def on_disconnect(device) -> None:
     global _session_active
     _session_active = False
+    _reset_rx()
+    if _tx_queue:
+        _tx_queue.clear()
     logger.info('Disconnected: %s', device)
+    # Murata 1YN/BlueZ 5.82: the LEAdvertisement1 instance is dropped from
+    # the controller after central-disconnect and is NOT auto-resumed.
+    # Without re-registering here the device stays invisible to future scans
+    # until the service is manually restarted. Defer 500 ms so BlueZ' own
+    # post-disconnect bookkeeping settles before we re-register.
+    GLib.timeout_add(500, _restart_advertising_once)
+
+
+def _restart_advertising_once() -> bool:
+    """One-shot GLib timeout callback — re-register the advertisement so the
+    device becomes scannable again. Returns False so the timeout doesn't
+    auto-repeat."""
+    if _peripheral is None:
+        return False
+    advert = _peripheral.advert
+    ad_manager = _peripheral.ad_manager
+    try:
+        ad_manager.unregister_advertisement(advert)
+        logger.debug('Advertising: previous instance unregistered')
+    except dbus.DBusException as exc:
+        # Often "DoesNotExist" — the controller already dropped it. Benign.
+        logger.debug('Advertising: unregister skipped (%s)', exc.get_dbus_name())
+    except Exception as exc:
+        logger.debug('Advertising: unregister error (%s)', exc)
+    try:
+        ad_manager.register_advertisement(advert, {})
+        logger.info('Advertising re-registered after disconnect')
+    except Exception as exc:
+        logger.warning('Advertising: re-register failed (%s)', exc)
+    return False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -459,6 +1516,7 @@ def _setup_logging() -> None:
 # generic BLE scanners but immediately discoverable to our app.
 # ──────────────────────────────────────────────────────────────────────────────
 def main() -> None:
+    global _peripheral
     _setup_logging()
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
 
@@ -471,6 +1529,7 @@ def main() -> None:
     _set_kernel_adv_defaults()
 
     ble = peripheral.Peripheral(dongle_address)
+    _peripheral = ble
     ble.on_connect = on_connect
     ble.on_disconnect = on_disconnect
 
@@ -496,18 +1555,18 @@ def main() -> None:
     )
 
     ble.add_characteristic(
-        srv_id=1, chr_id=2, uuid=CONTROL_UUID,
+        srv_id=1, chr_id=2, uuid=REQUEST_UUID,
         value=[], notifying=False,
         flags=['write', 'write-without-response'],
-        write_callback=cb_control_write,
+        write_callback=cb_request_write,
     )
 
     ble.add_characteristic(
-        srv_id=1, chr_id=3, uuid=TELEMETRY_UUID,
-        value=[0] * 16, notifying=False,
+        srv_id=1, chr_id=3, uuid=RESPONSE_UUID,
+        value=[], notifying=False,
         flags=['read', 'notify'],
-        read_callback=cb_telemetry_read,
-        notify_callback=cb_telemetry_notify,
+        read_callback=cb_response_read,
+        notify_callback=cb_response_notify,
     )
 
     ble.add_characteristic(
@@ -517,19 +1576,48 @@ def main() -> None:
         read_callback=cb_identity_read,
     )
 
+    ble.add_characteristic(
+        srv_id=1, chr_id=5, uuid=SYSTEM_INFO_UUID,
+        value=list(_read_system_info_json()), notifying=False,
+        flags=['read'],
+        read_callback=cb_system_info_read,
+    )
+
     async_tools.add_timer_ms(HEARTBEAT_INTERVAL_MS, _heartbeat_tick)
-    async_tools.add_timer_seconds(TELEMETRY_INTERVAL_S, _telemetry_tick)
     async_tools.add_timer_seconds(1, _watchdog)
+
+    # Add Manufacturer Specific Data so the iOS scan list can render the
+    # correct controller type (M1 / L4 / HMI1) and serial number BEFORE the
+    # user taps to connect. The payload MUST fit alongside the 128-bit
+    # Service UUID in a single legacy 31-byte advertising packet — BlueZ
+    # 5.82 on this Broadcom chip rejects "Add Extended Advertising
+    # Parameters" with "Invalid Parameters (0x0d)" the moment the combined
+    # AD set exceeds 31 B, which leaves the device unadvertised entirely.
+    #
+    # Budget: 31 B total
+    #   3 B  Flags AD (1 len + 1 type + 1 flags)
+    #  18 B  128-bit Service UUID AD (1 len + 1 type + 16 UUID)
+    #   4 B  Manuf Data framing (1 len + 1 type + 2 company id)
+    #   ── ────
+    #  25 B  used → 6 B left for our payload
+    #
+    # _build_mfg_payload() respects this 6-byte ceiling.
+    mfg_payload = _build_mfg_payload()
+    ble.advert.manufacturer_data(MFG_COMPANY_ID, list(mfg_payload))
 
     _register_agent()
     _disable_pairing()
 
     logger.info('go-bt server starting (no LocalName, UUID-only advertising)')
+    logger.info('  MfgData company=0x%04X payload=%s (%d B)',
+                MFG_COMPANY_ID, mfg_payload.hex(), len(mfg_payload))
     logger.info('  Service:    %s', SERVICE_UUID)
     logger.info('  Heartbeat:  %s  [read, notify] @ %d ms', HEARTBEAT_UUID, HEARTBEAT_INTERVAL_MS)
-    logger.info('  Control:    %s  [write, w/o-r]', CONTROL_UUID)
-    logger.info('  Telemetry:  %s  [read, notify] @ %d s', TELEMETRY_UUID, TELEMETRY_INTERVAL_S)
+    logger.info('  Request:    %s  [write, w/o-r]  RPC chunked JSON', REQUEST_UUID)
+    logger.info('  Response:   %s  [read, notify]  RPC chunked JSON', RESPONSE_UUID)
     logger.info('  Identity:   %s  [read]  6-byte end0 MAC', IDENTITY_UUID)
+    logger.info('  SystemInfo: %s  [read]  JSON (model/hostname/hw/kernel/rootfs/sn)', SYSTEM_INFO_UUID)
+    logger.info('  RPC handlers: %s', ', '.join(sorted(_HANDLERS.keys())))
     ble.publish()
 
 
