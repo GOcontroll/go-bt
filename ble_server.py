@@ -40,6 +40,7 @@ SERVICE_UUID    = '4E2C7A1B-F3D5-4890-B6C8-2A9E0F7D3C5B'
 HEARTBEAT_UUID  = '4E2C7A30-F3D5-4890-B6C8-2A9E0F7D3C5B'
 CONTROL_UUID    = '4E2C7A31-F3D5-4890-B6C8-2A9E0F7D3C5B'
 TELEMETRY_UUID  = '4E2C7A32-F3D5-4890-B6C8-2A9E0F7D3C5B'
+IDENTITY_UUID   = '4E2C7A33-F3D5-4890-B6C8-2A9E0F7D3C5B'
 
 HEARTBEAT_INTERVAL_MS = 1000
 TELEMETRY_INTERVAL_S  = 5
@@ -391,6 +392,31 @@ def cb_telemetry_notify(notifying: bool, characteristic) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Identity — Pi → iPhone, read-only, 6 bytes raw MAC of the Ethernet interface.
+# Used by the iOS app to verify the controller against a QR-scanned MAC at
+# pairing time. Plain read (no notify): the MAC never changes during a session,
+# so a single ATT Read on connect is sufficient.
+# ──────────────────────────────────────────────────────────────────────────────
+def _read_identity_mac() -> bytes:
+    """Return the 6-byte Ethernet MAC of end0 (or eth0 fallback). All zeros if
+    neither interface has a readable address."""
+    for iface in ('end0', 'eth0'):
+        try:
+            with open(f'/sys/class/net/{iface}/address', 'r') as fh:
+                mac_str = fh.read().strip()
+            parts = mac_str.split(':')
+            if len(parts) == 6:
+                return bytes(int(p, 16) for p in parts)
+        except (OSError, ValueError):
+            continue
+    return bytes(6)
+
+
+def cb_identity_read():
+    return list(_read_identity_mac())
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Connect / disconnect — log only; bluezero handles all the link-layer plumbing
 # ──────────────────────────────────────────────────────────────────────────────
 def on_connect(device) -> None:
@@ -484,6 +510,13 @@ def main() -> None:
         notify_callback=cb_telemetry_notify,
     )
 
+    ble.add_characteristic(
+        srv_id=1, chr_id=4, uuid=IDENTITY_UUID,
+        value=list(_read_identity_mac()), notifying=False,
+        flags=['read'],
+        read_callback=cb_identity_read,
+    )
+
     async_tools.add_timer_ms(HEARTBEAT_INTERVAL_MS, _heartbeat_tick)
     async_tools.add_timer_seconds(TELEMETRY_INTERVAL_S, _telemetry_tick)
     async_tools.add_timer_seconds(1, _watchdog)
@@ -496,6 +529,7 @@ def main() -> None:
     logger.info('  Heartbeat:  %s  [read, notify] @ %d ms', HEARTBEAT_UUID, HEARTBEAT_INTERVAL_MS)
     logger.info('  Control:    %s  [write, w/o-r]', CONTROL_UUID)
     logger.info('  Telemetry:  %s  [read, notify] @ %d s', TELEMETRY_UUID, TELEMETRY_INTERVAL_S)
+    logger.info('  Identity:   %s  [read]  6-byte end0 MAC', IDENTITY_UUID)
     ble.publish()
 
 
