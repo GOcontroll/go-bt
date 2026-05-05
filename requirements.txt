@@ -1,0 +1,3 @@
+bluezero
+dbus-python
+PyGObject

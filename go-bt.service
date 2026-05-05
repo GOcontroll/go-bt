@@ -1,0 +1,16 @@
+[Unit]
+Description=GOcontroll BLE GATT server
+Documentation=https://github.com/GOcontroll/GOcontroll-Architecture/blob/master/ble/linux/spec.md
+After=bluetooth.target network.target
+Wants=bluetooth.target
+StartLimitIntervalSec=300
+StartLimitBurst=20
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/gocontroll/go-bt/ble_server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
