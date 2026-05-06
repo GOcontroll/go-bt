@@ -1225,15 +1225,17 @@ def _handler_can_info(_params: dict) -> dict:
 
 # --- services.list / services.set --------------------------------------------
 
-# Whitelist mirrors go-web-ui's handlers/service.py — services the user is
-# allowed to start/stop via the controller management UI. We deliberately
-# leave go-bt itself off the list: turning it off would kill our own RPC
-# channel and the iPhone could no longer reach the device to turn it on.
+# Whitelist mirrors go-web-ui's handlers/service.py with one substitution:
+# `go-bluetooth` (the legacy RFCOMM server) is replaced by `go-bt` (this
+# service). Including go-bt itself is a deliberate choice — disabling it
+# from the iPhone obviously kills the RPC channel mid-response, so the
+# iPhone times out and recovery requires SSH / webui / physical access.
+# Users who toggle this know what they're doing.
 _SERVICES_WHITELIST = (
     'ssh',
     'go-simulink',
     'nodered',
-    'go-bluetooth',
+    'go-bt',
     'go-upload-server',
     'go-auto-shutdown',
     'gadget-getty@ttyGS0',
@@ -1308,6 +1310,92 @@ def _handler_services_set(params: dict) -> dict:
         'active':  _systemctl_is_active(unit),
         'enabled': _systemctl_is_enabled(unit),
     }
+
+
+# --- ethernet.set_mode / ethernet.set_ip -------------------------------------
+
+_ETH_PROFILE_AUTO   = 'Wired connection auto'
+_ETH_PROFILE_STATIC = 'Wired connection static'
+
+
+def _nmcli_run(*args, timeout: float = 10.0) -> tuple:
+    """Run `nmcli ...` returning (ok, error_msg).
+    Captures stderr properly so up/down failures surface as RPC errors."""
+    cmd = ['nmcli'] + list(args)
+    try:
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout, text=True,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"nmcli {' '.join(args)}: timeout"
+    if result.returncode != 0:
+        msg = (result.stderr or result.stdout).strip() or f'exit {result.returncode}'
+        return False, msg
+    return True, ''
+
+
+def _handler_ethernet_set_mode(params: dict) -> dict:
+    """Switch the wired interface between DHCP ('auto') and a static-IP
+    profile ('static'). Mirrors the go-web-ui set_ethernet_mode pattern:
+    flip autoconnect on the two NM profiles, then bring the right one up.
+
+    Touching ethernet can drop a connected support tool — the BLE link
+    itself is unaffected since it runs on a separate radio."""
+    mode = params.get('mode')
+    if mode not in ('auto', 'static'):
+        raise ValueError("mode must be 'auto' or 'static'")
+
+    if mode == 'static':
+        keep, drop = _ETH_PROFILE_STATIC, _ETH_PROFILE_AUTO
+    else:
+        keep, drop = _ETH_PROFILE_AUTO, _ETH_PROFILE_STATIC
+
+    # Flip autoconnect first so a future reboot honours the user's choice.
+    _nmcli_run('con', 'mod', drop, 'connection.autoconnect', 'no', timeout=5.0)
+    _nmcli_run('con', 'mod', keep, 'connection.autoconnect', 'yes', timeout=5.0)
+    # Bring down the unused profile, then bring up the chosen one. NM
+    # serialises these on the device so we don't race ourselves.
+    _nmcli_run('con', 'down', drop, timeout=10.0)
+    ok, err = _nmcli_run('con', 'up', keep, timeout=20.0)
+    if not ok:
+        raise RuntimeError(f"failed to activate '{keep}': {err}")
+    return {'mode': mode}
+
+
+def _handler_ethernet_set_ip(params: dict) -> dict:
+    """Update the static-profile IPv4 address. Uses /16 to match the
+    existing go-web-ui contract (controllers ship as DHCP servers on a
+    /16 subnet for industrial deployments). The new address is applied
+    immediately if the static profile is currently active; otherwise it
+    sticks for the next activation."""
+    ip = params.get('ip')
+    if not isinstance(ip, str) or not ip:
+        raise ValueError('`ip` is required')
+    import ipaddress
+    try:
+        ipaddress.IPv4Address(ip)
+    except ValueError as exc:
+        raise ValueError(f'invalid IPv4 address: {exc}')
+
+    ok, err = _nmcli_run(
+        'con', 'mod', _ETH_PROFILE_STATIC, 'ipv4.addresses', f'{ip}/16',
+        timeout=5.0,
+    )
+    if not ok:
+        raise RuntimeError(f"failed to set static IP: {err}")
+
+    state = _run_capture(
+        ['nmcli', '-t', '-f', 'GENERAL.STATE', 'con', 'show', _ETH_PROFILE_STATIC],
+        timeout=2.0,
+    )
+    if state and 'activated' in state:
+        # Bounce the connection so the new IP takes effect now.
+        _nmcli_run('con', 'down', _ETH_PROFILE_STATIC, timeout=5.0)
+        ok, err = _nmcli_run('con', 'up', _ETH_PROFILE_STATIC, timeout=10.0)
+        if not ok:
+            raise RuntimeError(f"failed to re-activate static profile: {err}")
+    return {'ip': ip}
 
 
 # --- wifi.scan / wifi.set_mode / wifi.connect --------------------------------
@@ -1425,18 +1513,69 @@ def _handler_wifi_connect(params: dict) -> dict:
     }
 
 
+# --- can.set_bitrate ---------------------------------------------------------
+
+# Standard classic-CAN bitrates we accept. iOS' picker offers exactly these.
+# Higher rates (CAN-FD) need a separate handler with sample-point + dbitrate.
+_CAN_VALID_BITRATES = {125_000, 250_000, 500_000, 1_000_000}
+
+
+def _handler_can_set_bitrate(params: dict) -> dict:
+    """Reconfigure a CAN interface's bitrate via `go-can set <ifc> bitrate N`.
+
+    go-can handles the down → reconfigure → up sequence transparently and
+    persists the change to /etc/gocontroll/can.d/<ifc>.conf. Returns the
+    post-change snapshot from the same code path can.info uses, so the
+    sheet UI can update without an extra round-trip."""
+    iface = params.get('interface')
+    bitrate = params.get('bitrate')
+    if not isinstance(iface, str) or not re.match(r'^can\d+$', iface):
+        raise ValueError(f'invalid interface: {iface!r}')
+    if not isinstance(bitrate, int) or bitrate not in _CAN_VALID_BITRATES:
+        raise ValueError(
+            f'bitrate must be one of {sorted(_CAN_VALID_BITRATES)} bit/s'
+        )
+
+    cmd = ['go-can', 'set', iface, 'bitrate', str(bitrate)]
+    try:
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=10, text=True,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f'go-can set {iface} bitrate: timeout')
+    if result.returncode != 0:
+        msg = (result.stderr or result.stdout).strip() or f'exit {result.returncode}'
+        raise RuntimeError(f'go-can set {iface} bitrate: {msg}')
+
+    # Update bitrate cache so the next can.info call reflects the change
+    # immediately instead of returning the stale TTL'd value.
+    _can_bitrate_cache[iface] = (time.monotonic(), bitrate)
+
+    operstate = _read_iface_operstate(iface)
+    return {
+        'interface': iface,
+        'bitrate':   bitrate,
+        'kbps':      bitrate // 1000,
+        'up':        operstate == 'up',
+    }
+
+
 # --- handler-tabel -----------------------------------------------------------
 
 _HANDLERS = {
-    'system.stats':   _handler_system_stats,
-    'modules.info':   _handler_modules_info,
-    'network.info':   _handler_network_info,
-    'can.info':       _handler_can_info,
-    'services.list':  _handler_services_list,
-    'services.set':   _handler_services_set,
-    'wifi.scan':      _handler_wifi_scan,
-    'wifi.set_mode':  _handler_wifi_set_mode,
-    'wifi.connect':   _handler_wifi_connect,
+    'system.stats':       _handler_system_stats,
+    'modules.info':       _handler_modules_info,
+    'network.info':       _handler_network_info,
+    'can.info':           _handler_can_info,
+    'services.list':      _handler_services_list,
+    'services.set':       _handler_services_set,
+    'ethernet.set_mode':  _handler_ethernet_set_mode,
+    'ethernet.set_ip':    _handler_ethernet_set_ip,
+    'wifi.scan':          _handler_wifi_scan,
+    'wifi.set_mode':      _handler_wifi_set_mode,
+    'wifi.connect':       _handler_wifi_connect,
+    'can.set_bitrate':    _handler_can_set_bitrate,
 }
 
 
