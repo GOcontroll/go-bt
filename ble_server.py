@@ -905,16 +905,31 @@ def _handler_modules_info(_params: dict) -> dict:
                 continue
             fw_str = entry.get('firmware', '') or ''
             parsed = _parse_module_firmware(fw_str)
+            # Pass-through identification fields straight from modules.json
+            # (written by `go-modules scan`). The QR codes are the printed
+            # numbers on the module's physical labels — useful for the
+            # iOS "tap a slot" detail view to identify a specific
+            # physical module without pulling the controller open.
+            manufacturer = entry.get('manufacturer')
+            qr_front = entry.get('qr_front')
+            qr_back = entry.get('qr_back')
             if parsed is None:
                 slots.append({'slot': slot, 'empty': True})
             else:
-                slots.append({
+                row = {
                     'slot': slot,
                     'type': parsed['type'],
                     'hw_version': parsed['hw_version'],
                     'fw_version': parsed['fw_version'],
                     'empty': False,
-                })
+                }
+                if isinstance(manufacturer, int):
+                    row['manufacturer'] = manufacturer
+                if isinstance(qr_front, int) and qr_front > 0:
+                    row['qr_front'] = qr_front
+                if isinstance(qr_back, int) and qr_back > 0:
+                    row['qr_back'] = qr_back
+                slots.append(row)
     slots.sort(key=lambda s: s['slot'])
     return {'slots': slots}
 
