@@ -87,16 +87,20 @@ ADV_MAX_INTERVAL_MS = 100
 AGENT_PATH       = '/com/gocontroll/agent'
 AGENT_CAPABILITY = 'NoInputNoOutput'
 
-# Manufacturer Specific Data — 16-bit company ID, payload broadcast in scan
-# response. 0xFFFF is the BLE SIG "test/proprietary" range; safe for our use
-# until we register an official company ID. The payload is intentionally
-# compact so it fits next to the 128-bit Service UUID without crowding the
-# primary advertising packet (BlueZ moves it into the scan response).
+# Manufacturer Specific Data — 16-bit company ID, payload broadcast next to
+# the 128-bit Service UUID in the primary advertising packet. 0xFFFF is the
+# BLE SIG "test/proprietary" range; safe for our use until we register an
+# official company ID.
 #
+# Layout (2 bytes total):
 #   payload[0]   version    uint8   currently 0x01
 #   payload[1]   model      uint8   1=L4, 2=M1, 3=HMI1, 0=unknown
-#   payload[2]   serial_len uint8   N in bytes (≤ 28 to keep the ad legal)
-#   payload[3..] serial     ASCII   `go-sn r` output (e.g. "B1AL-B055-B001-A002")
+#
+# The serial number is no longer in manuf-data — it ships in the BLE
+# LocalName (AD type 0x09) which BlueZ spills into the scan-response
+# AD-set when the primary adv is full. iOS' active scan reads both the
+# primary adv and the scan-response, so the iPhone app sees the full
+# serial pre-connect via `kCBAdvertisementDataLocalNameKey`.
 MFG_COMPANY_ID    = 0xFFFF
 MFG_PAYLOAD_VERSION = 0x01
 
@@ -591,33 +595,39 @@ def _read_wifi_rssi() -> int:
 
 
 def _build_mfg_payload() -> bytes:
-    """Compact identification blob — fixed 6-byte layout to fit the legacy
-    31-byte BLE advertising packet alongside our 128-bit Service UUID.
+    """Compact identification blob — fixed 2-byte layout that lives next to
+    the 128-bit Service UUID in the primary advertising packet.
 
     Layout:
-        byte 0      version       UInt8 — currently 0x01
-        byte 1      model         UInt8 — 1=L4, 2=M1, 3=HMI1, 0=unknown
-        bytes 2..5  serial_tail   ASCII — last 4 chars of `go-sn r`,
-                                   left-padded with 0x00 if shorter
+        byte 0   version  UInt8 — currently 0x01
+        byte 1   model    UInt8 — 1=L4, 2=M1, 3=HMI1, 0=unknown
 
-    Why only the tail: BlueZ 5.82 on the Broadcom chip rejects
-    "Add Extended Advertising Parameters" with Invalid Parameters (0x0d) the
-    moment the AD set exceeds 31 B, which silently kills advertising. Full
-    serial fits comfortably in the SystemInfo characteristic post-connect;
-    pre-connect we only need enough to disambiguate a fleet on the bench.
+    The full serial number is published separately via the BLE LocalName
+    (see _build_local_name) which BlueZ spills into the scan-response
+    AD-set. That keeps the manuf-data tiny — version + model only —
+    while still surfacing the SN pre-connect on iOS.
     """
-    model_byte = _detect_model_byte()
-    serial = _run_capture(['go-sn', 'r']).strip()
-    serial_bytes = serial.encode('ascii', errors='ignore')
-    if len(serial_bytes) >= 4:
-        tail = serial_bytes[-4:]
-    else:
-        tail = b'\x00' * (4 - len(serial_bytes)) + serial_bytes
     payload = bytearray()
     payload.append(MFG_PAYLOAD_VERSION)
-    payload.append(model_byte)
-    payload.extend(tail)
+    payload.append(_detect_model_byte())
     return bytes(payload)
+
+
+def _build_local_name() -> str:
+    """Serial number, used as the BLE LocalName so iOS can show it in the
+    scan list before the user taps to connect.
+
+    BlueZ 5.82 on the Broadcom chip in M1/L4 fits the 128-bit Service UUID
+    + 2-byte manuf-data in the primary AD-set (≤ 25 B). The LocalName
+    pushes the total over 31 B, so BlueZ moves the LocalName into the
+    scan-response AD-set automatically — that's a separate 31-byte budget,
+    delivered to iOS during active scanning. A typical serial like
+    "B1AL-B055-B001-A002" (19 chars + 2 framing = 21 B) fits comfortably.
+
+    Falls back to an empty string when `go-sn r` is not available; bluezero
+    then omits the LocalName altogether.
+    """
+    return _run_capture(['go-sn', 'r']).strip()
 
 
 def _read_temp_c() -> "float | None":
@@ -845,7 +855,9 @@ def _run_capture_argv(argv: list, timeout: float = 3.0) -> str:
 
 # --- modules.info ------------------------------------------------------------
 
-_MODULES_JSON_PATH = '/lib/firmware/gocontroll/modules.json'
+_MODULES_JSON_PATH     = '/lib/firmware/gocontroll/modules.json'
+_MODULES_DEV_JSON_PATH = '/lib/firmware/gocontroll/modules_dev.json'
+_SHM_SLOT_DIR_FMT      = '/dev/shm/slot{slot}/{article}'
 
 def _parse_module_firmware(fw_str: str) -> "dict | None":
     """Parse '20-20-2-6-2-2-0' → dict {type, hw_version, fw_version}.
@@ -932,6 +944,132 @@ def _handler_modules_info(_params: dict) -> dict:
                 slots.append(row)
     slots.sort(key=lambda s: s['slot'])
     return {'slots': slots}
+
+
+# --- modules.channels.{config,values} ----------------------------------------
+
+def _article_from_firmware(fw_str: str) -> "str | None":
+    """Strip the trailing 3-segment SW version from a 7-segment firmware
+    identifier so we get the article number used in /dev/shm paths.
+
+    Example: '20-10-1-5-2-0-3' → '20-10-1-5'  (2-0-3 is sw_major-minor-patch).
+    Returns None when the firmware string isn't well-formed.
+    """
+    if not fw_str:
+        return None
+    parts = fw_str.split('-')
+    if len(parts) < 4:
+        return None
+    return '-'.join(parts[:-3])
+
+
+def _read_modules_dev_entry(slot: int) -> "dict | None":
+    """Locate the per-slot entry in modules_dev.json. Returns None when the
+    file is missing, malformed, or doesn't contain this slot."""
+    try:
+        with open(_MODULES_DEV_JSON_PATH, 'r') as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f'cannot read modules_dev.json: {exc}')
+    if not isinstance(raw, list):
+        return None
+    for entry in raw:
+        if isinstance(entry, dict) and entry.get('slot') == slot:
+            return entry
+    return None
+
+
+def _handler_modules_channels_config(params: dict) -> dict:
+    """Return the per-channel configuration for one slot from modules_dev.json.
+
+    Schema (subset of modules_dev.json[slot]):
+        {slot, article, type?, sensor_supply?, channels: [...]}
+
+    Returns `{config: null}` when the slot is empty / unconfigured so the
+    iPhone-side can render a "no channel info" placeholder uniformly,
+    instead of failing the RPC. Hard errors (unreadable file, malformed
+    JSON) propagate as RPC errors via the RuntimeError above.
+    """
+    slot = params.get('slot')
+    if not isinstance(slot, int) or slot < 1:
+        raise ValueError('slot must be a positive int')
+    entry = _read_modules_dev_entry(slot)
+    if entry is None:
+        return {'config': None}
+    fw_str = entry.get('firmware') or ''
+    article = _article_from_firmware(fw_str)
+    config = entry.get('config')
+    if not isinstance(config, dict) or article is None:
+        return {'config': None}
+    channels = config.get('channels')
+    if not isinstance(channels, list):
+        return {'config': None}
+    out = {
+        'slot': slot,
+        'article': article,
+        'channels': channels,
+    }
+    if isinstance(entry.get('type'), str):
+        out['type'] = entry['type']
+    if isinstance(config.get('sensor_supply'), dict):
+        out['sensor_supply'] = config['sensor_supply']
+    return {'config': out}
+
+
+def _read_channel_value(path: str) -> "int | None":
+    """Read one /dev/shm/slot.../channelN file. Format is space-padded
+    ASCII int + '\\n'; returns the parsed integer, or None when the file
+    is missing or unparseable. Missing files are normal (e.g. when a
+    channel is configured but no module-side process has populated the
+    shm value yet) — surface them as null so the UI can render a dash."""
+    try:
+        with open(path, 'r') as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _handler_modules_channels_values(params: dict) -> dict:
+    """Return the live values for one slot's channels from /dev/shm.
+
+    Builds the channel list from modules_dev.json (so the iPhone-side
+    sees a stable channel set) then reads each /dev/shm path. The shm
+    entries match the directory layout we observe on M1:
+        /dev/shm/slot{N}/{article}/channel{M}
+    """
+    slot = params.get('slot')
+    if not isinstance(slot, int) or slot < 1:
+        raise ValueError('slot must be a positive int')
+    entry = _read_modules_dev_entry(slot)
+    if entry is None:
+        return {'values': None}
+    fw_str = entry.get('firmware') or ''
+    article = _article_from_firmware(fw_str)
+    if article is None:
+        return {'values': None}
+    config = entry.get('config') or {}
+    channels = config.get('channels')
+    if not isinstance(channels, list) or not channels:
+        return {'values': None}
+    base_dir = _SHM_SLOT_DIR_FMT.format(slot=slot, article=article)
+    values: dict = {}
+    for ch in channels:
+        if not isinstance(ch, dict):
+            continue
+        idx = ch.get('channel')
+        if not isinstance(idx, int) or idx < 1:
+            continue
+        path = f'{base_dir}/channel{idx}'
+        values[str(idx)] = _read_channel_value(path)
+    return {
+        'values': {
+            'slot': slot,
+            'article': article,
+            'channels': values,
+        }
+    }
 
 
 # --- system.stats ------------------------------------------------------------
@@ -1672,7 +1810,9 @@ def _require_auth() -> None:
 _HANDLERS = {
     'auth.login':         _handler_auth_login,
     'system.stats':       _handler_system_stats,
-    'modules.info':       _handler_modules_info,
+    'modules.info':              _handler_modules_info,
+    'modules.channels.config':   _handler_modules_channels_config,
+    'modules.channels.values':   _handler_modules_channels_values,
     'network.info':       _handler_network_info,
     'can.info':           _handler_can_info,
     'services.list':      _handler_services_list,
@@ -1840,29 +1980,42 @@ def main() -> None:
     async_tools.add_timer_ms(HEARTBEAT_INTERVAL_MS, _heartbeat_tick)
     async_tools.add_timer_seconds(1, _watchdog)
 
-    # Add Manufacturer Specific Data so the iOS scan list can render the
-    # correct controller type (M1 / L4 / HMI1) and serial number BEFORE the
-    # user taps to connect. The payload MUST fit alongside the 128-bit
-    # Service UUID in a single legacy 31-byte advertising packet — BlueZ
-    # 5.82 on this Broadcom chip rejects "Add Extended Advertising
-    # Parameters" with "Invalid Parameters (0x0d)" the moment the combined
-    # AD set exceeds 31 B, which leaves the device unadvertised entirely.
+    # Add Manufacturer Specific Data + LocalName so the iOS scan list can
+    # render the correct controller type (M1 / L4 / HMI1) and the full
+    # serial number BEFORE the user taps to connect. Two AD-sets:
     #
-    # Budget: 31 B total
+    # Primary advertising packet (≤ 31 B):
     #   3 B  Flags AD (1 len + 1 type + 1 flags)
     #  18 B  128-bit Service UUID AD (1 len + 1 type + 16 UUID)
     #   4 B  Manuf Data framing (1 len + 1 type + 2 company id)
+    #   2 B  Manuf Data payload  (version + model)
     #   ── ────
-    #  25 B  used → 6 B left for our payload
+    #  27 B  used → 4 B free
     #
-    # _build_mfg_payload() respects this 6-byte ceiling.
+    # Scan-response packet (≤ 31 B):
+    #   2 B  LocalName framing (1 len + 1 type)
+    #   N B  LocalName payload (`go-sn r` output, typically 19 chars)
+    #
+    # BlueZ decides automatically that the LocalName won't fit in the
+    # primary packet alongside the items above, and spills it to the
+    # scan-response AD-set. iOS active-scans, reads both AD-sets, and
+    # exposes the LocalName via kCBAdvertisementDataLocalNameKey.
+    #
+    # Why this works while LE Extended Advertising fails: Ext-Adv goes
+    # through a different kernel/HCI path on this Broadcom chip and
+    # returns Invalid Parameters (0x0d). Legacy adv + scan-response uses
+    # the standard LL path which is well-supported.
     mfg_payload = _build_mfg_payload()
     ble.advert.manufacturer_data(MFG_COMPANY_ID, list(mfg_payload))
+    local_name = _build_local_name()
+    if local_name:
+        ble.advert.local_name = local_name
 
     _register_agent()
     _disable_pairing()
 
-    logger.info('go-bt server starting (no LocalName, UUID-only advertising)')
+    logger.info('go-bt server starting (LocalName=%r, MfgData + Service UUID adv)',
+                local_name or '(omitted)')
     logger.info('  MfgData company=0x%04X payload=%s (%d B)',
                 MFG_COMPANY_ID, mfg_payload.hex(), len(mfg_payload))
     logger.info('  Service:    %s', SERVICE_UUID)
