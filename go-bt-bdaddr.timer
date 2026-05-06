@@ -1,0 +1,18 @@
+[Unit]
+Description=Delayed flash of BD_ADDR after boot settles
+Documentation=https://github.com/GOcontroll/go-bt
+
+[Timer]
+# 60 s after multi-user.target — past the BCM4345C0 chip-init window
+# during which `btmgmt power off` hangs indefinitely. By this point
+# bluetoothd has been stable, the chip accepts the power-cycle, and
+# the address-set succeeds reliably.
+#
+# One-shot per boot. If the address is already correct (e.g. on a
+# subsequent service restart) the script no-ops out without touching
+# the chip.
+OnBootSec=60s
+Unit=go-bt-bdaddr.service
+
+[Install]
+WantedBy=timers.target

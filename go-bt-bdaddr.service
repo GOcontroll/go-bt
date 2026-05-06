@@ -1,0 +1,16 @@
+[Unit]
+Description=Flash deterministic BLE BD_ADDR derived from end0 MAC
+Documentation=https://github.com/GOcontroll/go-bt
+ConditionPathExists=/sys/class/net/end0
+
+[Service]
+# Type=simple matches what `systemd-run` uses for its transient units —
+# `Type=oneshot` provoked btmgmt to hang indefinitely when the script
+# was triggered by go-bt-bdaddr.timer, even though the same script ran
+# fine interactively and via `systemd-run --wait`. The exact mechanism
+# isn't documented but the workaround sticks.
+Type=simple
+ExecStart=/usr/local/sbin/go-bt-bdaddr.sh
+
+[Install]
+WantedBy=multi-user.target

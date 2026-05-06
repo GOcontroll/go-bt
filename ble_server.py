@@ -32,6 +32,7 @@ Run:
     sudo /usr/bin/python3 /opt/gocontroll/go-bt/ble_server.py
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -137,6 +138,14 @@ _tx_pumping: bool = False
 # hervat 'm niet automatisch — zonder re-register is het apparaat na de
 # eerste connect-cycle "verdwenen" voor latere scans tot de service herstart.
 _peripheral = None
+
+# Per-session auth flag. Geset door cb_request_write zodra `auth.login` met
+# een geldige hash binnenkomt; gewist op disconnect. Write-commando's
+# (services.set, ethernet.*, wifi.* met set, can.set_bitrate) checken deze
+# vlag; read-commando's en de bootstrap-laag staan altijd open.
+_session_authenticated: bool = False
+
+CONF_PATH = '/etc/go_bluetooth.conf'
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1283,6 +1292,7 @@ def _systemctl_run(verb: str, unit: str) -> tuple:
 
 
 def _handler_services_set(params: dict) -> dict:
+    _require_auth()
     unit = params.get('unit')
     enable = params.get('enable')
     if not isinstance(unit, str) or unit not in _SERVICES_WHITELIST:
@@ -1342,6 +1352,7 @@ def _handler_ethernet_set_mode(params: dict) -> dict:
 
     Touching ethernet can drop a connected support tool — the BLE link
     itself is unaffected since it runs on a separate radio."""
+    _require_auth()
     mode = params.get('mode')
     if mode not in ('auto', 'static'):
         raise ValueError("mode must be 'auto' or 'static'")
@@ -1369,6 +1380,7 @@ def _handler_ethernet_set_ip(params: dict) -> dict:
     /16 subnet for industrial deployments). The new address is applied
     immediately if the static profile is currently active; otherwise it
     sticks for the next activation."""
+    _require_auth()
     ip = params.get('ip')
     if not isinstance(ip, str) or not ip:
         raise ValueError('`ip` is required')
@@ -1447,6 +1459,7 @@ def _handler_wifi_set_mode(params: dict) -> dict:
     """Switch between Access Point and Client. Mirrors go-web-ui's
     set_wifi_type — toggles the autoconnect flag on the AP profile vs the
     user's regular wifi connections, then brings the right one up."""
+    _require_auth()
     mode = params.get('mode')
     if mode not in ('ap', 'client'):
         raise ValueError("mode must be 'ap' or 'client'")
@@ -1482,6 +1495,7 @@ def _handler_wifi_set_mode(params: dict) -> dict:
 def _handler_wifi_connect(params: dict) -> dict:
     """Connect to a WiFi network as a client. Creates / updates the nmcli
     connection profile and brings it up. Returns the resolved IP on success."""
+    _require_auth()
     ssid = params.get('ssid')
     password = params.get('password', '')
     if not isinstance(ssid, str) or not ssid:
@@ -1527,6 +1541,7 @@ def _handler_can_set_bitrate(params: dict) -> dict:
     persists the change to /etc/gocontroll/can.d/<ifc>.conf. Returns the
     post-change snapshot from the same code path can.info uses, so the
     sheet UI can update without an extra round-trip."""
+    _require_auth()
     iface = params.get('interface')
     bitrate = params.get('bitrate')
     if not isinstance(iface, str) or not re.match(r'^can\d+$', iface):
@@ -1561,9 +1576,86 @@ def _handler_can_set_bitrate(params: dict) -> dict:
     }
 
 
+# --- auth.login (one-shot session authentication) ----------------------------
+#
+# Lichtgewicht model: client stuurt SHA256(canonical end0 MAC) na connect.
+# Server vergelijkt met `pass_hash` uit /etc/go_bluetooth.conf (default =
+# zelfde sha256(MAC) als de conf-file ontbreekt). Bij match: sessie
+# geauthenticeerd tot disconnect. Geen ongoing handshake per write.
+#
+# Threat-model: geeft GEEN crypto-bescherming tegen iemand die binnen BLE-
+# bereik zit en de MAC kan lezen uit IDENTITY of de adv. Het is een
+# explicit-handshake-laag bovenop de bestaande proximity-protection
+# (Just-Works pairing + QR-pair flow + adv invisible-buiten-app). Vooral
+# nuttig om per ongeluk schrijven door verkeerde apps te voorkomen, en als
+# vangrail mocht een toekomstig pass_hash met sterker geheim ingesteld zijn.
+
+_AUTH_REQUIRED_ERROR = 'auth_required: call auth.login before this command'
+
+
+def _read_pass_hash() -> str:
+    """Return de geconfigureerde pass_hash, of het default `sha256(MAC)`.
+
+    Conf-formaat (`/etc/go_bluetooth.conf`):
+        pass_hash=<64-char hex sha256 digest>
+
+    Default: sha256 van de canonical lowercase end0 MAC met dubbele punten,
+    bv. `sha256("00:0c:c6:94:91:77")`. Hash-input is dus exact wat IDENTITY
+    teruggeeft als string-form."""
+    if os.path.exists(CONF_PATH):
+        try:
+            with open(CONF_PATH, 'r') as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if '=' not in line:
+                        continue
+                    key, _, val = line.partition('=')
+                    if key.strip() == 'pass_hash':
+                        h = val.strip().lower()
+                        if len(h) == 64 and all(c in '0123456789abcdef' for c in h):
+                            return h
+        except OSError as exc:
+            logger.warning('auth: failed to read %s (%s); falling back to MAC default',
+                           CONF_PATH, exc)
+    mac = _read_identity_mac()
+    canonical = ':'.join(f'{b:02x}' for b in mac)
+    return hashlib.sha256(canonical.encode('ascii')).hexdigest()
+
+
+def _handler_auth_login(params: dict) -> dict:
+    """Validate the supplied hash against `pass_hash`. Marks the session as
+    authenticated on success; subsequent write-commands within the same
+    BLE session are then permitted until disconnect."""
+    global _session_authenticated
+    import hmac
+    supplied = params.get('hash')
+    if not isinstance(supplied, str) or len(supplied) != 64:
+        raise ValueError('hash must be a 64-char hex sha256 digest')
+    expected = _read_pass_hash()
+    # Constant-time compare — BLE-link RTT dominates the timing channel
+    # anyway, but `hmac.compare_digest` is the right habit for any
+    # secret-comparison code path.
+    if not hmac.compare_digest(supplied.lower(), expected):
+        _session_authenticated = False
+        raise PermissionError('invalid credentials')
+    _session_authenticated = True
+    logger.info('Auth: session authenticated')
+    return {'authenticated': True}
+
+
+def _require_auth() -> None:
+    """Raise PermissionError als de huidige RPC-sessie niet geauthenticeerd
+    is. Aangeroepen door alle write-handlers vóór ze daadwerkelijk muteren."""
+    if not _session_authenticated:
+        raise PermissionError(_AUTH_REQUIRED_ERROR)
+
+
 # --- handler-tabel -----------------------------------------------------------
 
 _HANDLERS = {
+    'auth.login':         _handler_auth_login,
     'system.stats':       _handler_system_stats,
     'modules.info':       _handler_modules_info,
     'network.info':       _handler_network_info,
@@ -1587,8 +1679,9 @@ def on_connect(device) -> None:
 
 
 def on_disconnect(device) -> None:
-    global _session_active
+    global _session_active, _session_authenticated
     _session_active = False
+    _session_authenticated = False
     _reset_rx()
     if _tx_queue:
         _tx_queue.clear()
@@ -1666,6 +1759,13 @@ def main() -> None:
     logger.info('Adapter: %s', dongle_address)
 
     _set_kernel_adv_defaults()
+    # NOTE: BD_ADDR flash is NOT done here — the BCM4345C0 chip rejects
+    # btmgmt power-off in the first ~60 s after boot, which made go-bt's
+    # startup hang for a minute on retries. The flash is now handled by
+    # `go-bt-bdaddr.service` (oneshot) triggered by `go-bt-bdaddr.timer`
+    # `OnBootSec=60s` after multi-user.target — safely past the chip's
+    # warm-up window. The script restarts go-bt itself once the flip
+    # succeeds so the new address is broadcast immediately.
 
     ble = peripheral.Peripheral(dongle_address)
     _peripheral = ble
