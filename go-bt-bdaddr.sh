@@ -95,7 +95,8 @@ timeout 5 btmgmt --index 0 power on >/dev/null 2>&1 || true
 sleep 1
 
 echo "$LOG_PREFIX: hci0 now at $LE_ADDR; restarting go-bt to advertise with new address"
-systemctl restart go-bt.service || {
+# try-restart: a go-bt the user switched off (services.set over BLE) stays off.
+systemctl try-restart go-bt.service || {
     echo "$LOG_PREFIX: WARNING — go-bt restart failed; address is set but adv may need manual restart" >&2
     exit 0
 }

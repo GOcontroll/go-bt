@@ -17,11 +17,17 @@ Phase 1 — hybrid model:
         byte 1 : total (count of frames in this message, uint8 > 0)
         2..    : utf-8 JSON fragment
 
-    Phase-1 commands (all read-only, no auth):
-        system.stats   → {cpu, temp_c, mem_pct, uptime_s}
-        modules.info   → {slots: [{slot, type, hw_version, fw_version, empty}]}
-        network.info   → {ethernet:{...}, wifi:{...}, wwan:{...}}
-        can.info       → {interfaces:[{id,present,up,kbps}], load:{canX:pct}}
+    Read commands (no auth):
+        system.stats     → {cpu, temp_c, mem_pct, uptime_s, supply, accel}
+        system.software  → {application:{simulink_version}, packages:[...]}
+        modules.info     → {slots: [{slot, type, hw_version, fw_version, empty}]}
+        network.info     → {ethernet:{...}, wifi:{...}, wwan:{...}}
+        can.info         → {interfaces:[{id,present,up,kbps,state}], load:{canX:pct}}
+        services.list, wifi.scan, wifi.saved
+
+    Write commands (after auth.login): services.set, ethernet.set_mode,
+    ethernet.set_ip, wifi.set_enabled, wifi.set_mode, wifi.set_ap,
+    wifi.connect, wifi.connect_saved, wifi.forget, can.set_bitrate
 
 Backwards-compat met oude iOS-app: de OUDE app schrijft 4-byte keepalive naar
 Control en abonneert NIET op Telemetry. Beide cases zijn benign — onze
@@ -120,10 +126,12 @@ _session_active:  bool  = False
 _cpu_prev_idle:  int = 0
 _cpu_prev_total: int = 0
 
-# CAN busload differential state (per-iface deltas across system.stats / can.info)
+# CAN busload differential state (per-iface deltas across can.info calls)
 _can_load_state: dict = {}     # ifc -> {"t": monotonic, "p": packets, "b": bytes}
-_can_bitrate_cache: dict = {}  # ifc -> (cached_at_monotonic, bitrate_bps)
-_CAN_BITRATE_TTL_S = 30.0
+
+# IIO device directories by kernel name ("mcp3004", "lis2dw12"). Only hits are
+# cached: the numbering is fixed per boot, a driver that probes late is retried.
+_iio_device_cache: dict = {}
 
 # RPC reassembly state (server-side rx) — frames van de iPhone
 _rx_buf:   bytearray = bytearray()
@@ -317,6 +325,10 @@ def cb_heartbeat_notify(notifying: bool, characteristic) -> None:
 # De `id` is door de client gekozen en uniek genoeg (uint32 wraparound is OK
 # zolang er nooit twee in-flight zijn met dezelfde id; iOS-kant garandeert dit).
 
+# Request params that never go into the log (Wi-Fi passwords, auth hash).
+_SECRET_PARAMS = ('password', 'hash')
+
+
 def _reset_rx() -> None:
     global _rx_buf, _rx_total, _rx_seq
     _rx_buf = bytearray()
@@ -379,7 +391,9 @@ def cb_request_write(value, options) -> None:
         logger.warning('RPC: missing/invalid cmd in request id=%r', req_id)
         return
 
-    logger.info('RPC ← id=%s cmd=%s params=%s', req_id, cmd, params)
+    logged = ({k: ('***' if k in _SECRET_PARAMS else v) for k, v in params.items()}
+              if isinstance(params, dict) else params)
+    logger.info('RPC ← id=%s cmd=%s params=%s', req_id, cmd, logged)
     _dispatch_request(req_id, cmd, params)
 
 
@@ -495,16 +509,52 @@ def _watchdog() -> bool:
 # ──────────────────────────────────────────────────────────────────────────────
 # Data-collection helpers — gedeeld tussen system.stats / network.info / can.info
 # ──────────────────────────────────────────────────────────────────────────────
+def _read_conf() -> dict:
+    """Parse /etc/go_bluetooth.conf (`key=value` lines, `#` comments) into a
+    dict with lowercase keys. Empty when the file is missing or unreadable."""
+    conf = {}
+    try:
+        # errors='replace': a stray byte must not crash startup (the model
+        # lookup for the advertisement reads this file).
+        with open(CONF_PATH, 'r', errors='replace') as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                key, _, val = line.partition('=')
+                # Inline comments are allowed after the value (CLAUDE.md example).
+                conf[key.strip().lower()] = val.split('#', 1)[0].strip()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.warning('conf: failed to read %s (%s)', CONF_PATH, exc)
+    return conf
+
+
 _MODEL_TO_BYTE = {'L4': 1, 'M1': 2, 'HMI1': 3}
+
+# Contact inputs (K15) per model — GOcontroll-Architecture
+# controller/static/info.md "Voeding en omgeving". Names follow the
+# GOcontroll-CodeBase supply indices (K15-A/B/C on ADC channel 0/1/2).
+_MODEL_K15_NAMES = {
+    'L4':   ('K15-A', 'K15-B', 'K15-C'),
+    'M1':   ('K15-A', 'K15-B', 'K15-C'),
+    'HMI1': ('K15',),
+}
 
 
 def _detect_model_name() -> str:
-    """Return the canonical short model name (M1 / L4 / HMI1) extracted from
-    the device-tree platform string, or an empty string if not detected.
+    """Return the canonical short model name (M1 / L4 / HMI1), or an empty
+    string if not detected. Order (linux/spec.md §3): `controller_model` in
+    /etc/go_bluetooth.conf, then the device-tree platform/model strings, then
+    the hardware string for 5.10 kernels without a platform node.
 
     Token-based matching — substring matching is a trap: "M1" appears inside
     "HMI1", so an `'m1' in raw` check would mis-identify an HMI1 as M1.
     """
+    override = _read_conf().get('controller_model', '').upper()
+    if override in _MODEL_TO_BYTE:
+        return override
     for path in ('/sys/firmware/devicetree/base/platform',
                  '/sys/firmware/devicetree/base/model'):
         try:
@@ -515,6 +565,15 @@ def _detect_model_name() -> str:
                     return token
         except OSError:
             continue
+    # The hardware string names the product family ("Moduline Mini V1.11"),
+    # same fallback go-web-ui uses (handlers/modules.py _classify).
+    hardware = _read_text_file('/sys/firmware/devicetree/base/hardware').lower()
+    if 'mini' in hardware:
+        return 'M1'
+    if 'display' in hardware or 'hmi' in hardware:
+        return 'HMI1'
+    if 'moduline iv' in hardware:
+        return 'L4'
     return ''
 
 
@@ -646,6 +705,103 @@ def _read_temp_c() -> "float | None":
         except (OSError, ValueError):
             continue
     return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Supply voltages + accelerometer — IIO sysfs, same sources and scaling as
+# GOcontroll-CodeBase code/GO_board.c (ControllerPower / ControllerInfo, Linux).
+#
+# Supply: MCP3004 ADC, mV = raw × 25.54, channels ch0 = K15-A, ch1 = K15-B,
+# ch2 = K15-C, ch3 = K30. Boards with an ADS1015 instead (Moduline IV
+# V3.00–V3.05, Mini V1.03) are read by the application over raw I²C with
+# unlocked single-shot conversions; go-bt stays off that bus so it cannot
+# corrupt the application's readings, and reports `supply: null` there.
+#
+# Accelerometer: LIS2DW12 (M1 only). A sysfs raw read fails with EBUSY while
+# the application streams the sensor through its IIO buffer — `accel: null`.
+# Each raw read also powers the sensor up and sleeps boot-time / ODR (st_accel:
+# 2 / ODR s); at the driver's 1 Hz default that is 6 s for three axes, which
+# would stall the single-threaded server, so below `_ACCEL_MIN_ODR_HZ` go-bt
+# reports null too. The ODR is the application's setting — go-bt never writes it.
+# ──────────────────────────────────────────────────────────────────────────────
+_IIO_DIR = '/sys/bus/iio/devices'
+_SUPPLY_MV_PER_LSB = 25.54          # ((3.35 / 1023) / 1.5) × 11700
+_SUPPLY_K30_CHANNEL = 3
+_STANDARD_GRAVITY = 9.80665
+_ACCEL_MIN_ODR_HZ = 25.0
+
+
+def _find_iio_device(name: str) -> "str | None":
+    """Return the sysfs directory of the IIO device whose `name` attribute
+    matches (e.g. /sys/bus/iio/devices/iio:device0), or None."""
+    cached = _iio_device_cache.get(name)
+    if cached:
+        return cached
+    try:
+        entries = sorted(os.listdir(_IIO_DIR))
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.startswith('iio:device'):
+            continue
+        path = f'{_IIO_DIR}/{entry}'
+        if _read_text_file(f'{path}/name') == name:
+            _iio_device_cache[name] = path
+            return path
+    return None
+
+
+def _read_number_file(path: str) -> "float | None":
+    """Read one numeric sysfs attribute; None when missing, busy or garbled."""
+    try:
+        with open(path, 'r') as fh:
+            return float(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _read_supply() -> "dict | None":
+    """{k30: V, k15: [{name, v}]} with one K15 entry per contact input of the
+    detected model (volts, 2 decimals, null per unreadable channel), or None
+    when the controller has no MCP3004."""
+    dev = _find_iio_device('mcp3004')
+    if dev is None:
+        return None
+
+    def volts(channel: int) -> "float | None":
+        raw = _read_number_file(f'{dev}/in_voltage{channel}_raw')
+        if raw is None:
+            return None
+        return round(raw * _SUPPLY_MV_PER_LSB / 1000.0, 2)
+
+    names = _MODEL_K15_NAMES.get(_detect_model_name(), _MODEL_K15_NAMES['L4'])
+    return {
+        'k30': volts(_SUPPLY_K30_CHANNEL),
+        'k15': [{'name': name, 'v': volts(ch)} for ch, name in enumerate(names)],
+    }
+
+
+def _read_accel() -> "dict | None":
+    """{x_mg, y_mg, z_mg} in milli-g from the LIS2DW12, or None when the
+    controller has none, the application holds it in buffered mode, or its
+    output data rate is too low to read without stalling."""
+    dev = _find_iio_device('lis2dw12')
+    if dev is None:
+        return None
+    odr = (_read_number_file(f'{dev}/sampling_frequency')
+           or _read_number_file(f'{dev}/in_accel_sampling_frequency'))
+    if odr is None or odr < _ACCEL_MIN_ODR_HZ:
+        return None
+    out = {}
+    for axis in ('x', 'y', 'z'):
+        raw = _read_number_file(f'{dev}/in_accel_{axis}_raw')
+        scale = (_read_number_file(f'{dev}/in_accel_{axis}_scale')
+                 or _read_number_file(f'{dev}/in_accel_scale'))
+        if raw is None or scale is None:
+            return None
+        # scale is m/s² per LSB (IIO ABI)
+        out[f'{axis}_mg'] = int(round(raw * scale / _STANDARD_GRAVITY * 1000.0))
+    return out
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1080,6 +1236,51 @@ def _handler_system_stats(_params: dict) -> dict:
         'temp_c':    _read_temp_c(),
         'mem_pct':   _read_mem_pct(),
         'uptime_s':  _read_uptime_s(),
+        'supply':    _read_supply(),
+        'accel':     _read_accel(),
+    }
+
+
+# --- system.software ---------------------------------------------------------
+
+_SIMULINK_VERSION_DIR = '/usr/mem-sim'
+
+
+def _read_simulink_version() -> "str | None":
+    """Model version the Simulink target writes to /usr/mem-sim/MODEL_{MAJOR,
+    FEATURE,FIX} (one gcvt-formatted number per file, e.g. "2" or "2.").
+    Same source as go-web-ui /api/get_sim_ver. None until a model has been
+    built with a version."""
+    parts = []
+    for name in ('MODEL_MAJOR', 'MODEL_FEATURE', 'MODEL_FIX'):
+        value = _read_number_file(f'{_SIMULINK_VERSION_DIR}/{name}')
+        if value is None:
+            return None
+        parts.append(str(int(value)))
+    return '.'.join(parts)
+
+
+def _installed_gocontroll_packages() -> list:
+    """[{name, version}] for every installed `go-*` Debian package."""
+    out = _run_capture(['dpkg-query', '-W',
+                        '-f=${Package}\t${Version}\t${db:Status-Abbrev}\n',
+                        'go-*'], timeout=5.0)
+    packages = []
+    for line in out.splitlines():
+        cols = line.split('\t')
+        # Status abbreviation: 2nd char 'i' = installed ("ii", held "hi");
+        # patterns also list removed/known packages.
+        if len(cols) >= 3 and cols[2][1:2] == 'i':
+            packages.append({'name': cols[0], 'version': cols[1]})
+    return sorted(packages, key=lambda p: p['name'])
+
+
+def _handler_system_software(_params: dict) -> dict:
+    return {
+        'application': {
+            'simulink_version': _read_simulink_version(),
+        },
+        'packages': _installed_gocontroll_packages(),
     }
 
 
@@ -1120,93 +1321,170 @@ def _read_iface_operstate(iface: str) -> str:
         return 'unknown'
 
 
-def _ethernet_info() -> dict:
-    iface = 'end0' if os.path.exists('/sys/class/net/end0') else 'eth0'
+def _nmcli_split(line: str) -> list:
+    """Split one `nmcli -t` table line on ':' honouring nmcli's escapes
+    (`\\:` = literal colon, `\\\\` = backslash) — SSIDs may contain either."""
+    fields, cur, escaped = [], [], False
+    for ch in line:
+        if escaped:
+            cur.append(ch)
+            escaped = False
+        elif ch == '\\':
+            escaped = True
+        elif ch == ':':
+            fields.append(''.join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    fields.append(''.join(cur))
+    return fields
+
+
+def _nmcli_connections() -> list:
+    """Every NetworkManager profile as {name, type, device, autoconnect, active}.
+    `type` is NM's long form, e.g. '802-11-wireless' / '802-3-ethernet'."""
+    out = _run_capture(['nmcli', '-t', '-f', 'NAME,TYPE,DEVICE,AUTOCONNECT,ACTIVE',
+                        'con', 'show'], timeout=3.0)
+    cons = []
+    for line in out.splitlines():
+        cols = _nmcli_split(line)
+        if len(cols) < 5:
+            continue
+        cons.append({
+            'name':        cols[0],
+            'type':        cols[1],
+            'device':      cols[2],
+            'autoconnect': cols[3] == 'yes',
+            'active':      cols[4] == 'yes',
+        })
+    return cons
+
+
+def _nmcli_profile_fields(name: str, *fields) -> dict:
+    """`nmcli con show <name>` restricted to `fields`, as {field: value}.
+    Unescaped (`-e no`): one field per line, so the value is everything after
+    the first ':'. Empty dict when the profile does not exist."""
+    out = _run_capture(['nmcli', '-t', '-e', 'no', '-f', ','.join(fields),
+                        'con', 'show', name], timeout=3.0)
+    values = {}
+    for line in out.splitlines():
+        key, sep, val = line.partition(':')
+        if sep:
+            values[key] = val
+    return values
+
+
+def _ethernet_iface() -> str:
+    return 'end0' if os.path.exists('/sys/class/net/end0') else 'eth0'
+
+
+def _ethernet_info(cons: "list | None" = None) -> dict:
+    iface = _ethernet_iface()
     operstate = _read_iface_operstate(iface)
     info = {
-        'iface':       iface,
-        'mac':         _read_iface_mac(iface),
-        'connected':   operstate == 'up',
-        'current_ip':  _read_iface_ip(iface),
-        'static_ip':   None,
-        'mode':        None,
+        'iface':         iface,
+        'mac':           _read_iface_mac(iface),
+        'connected':     operstate == 'up',
+        'current_ip':    _read_iface_ip(iface),
+        'static_ip':     None,
+        'static_prefix': None,
+        'mode':          None,
     }
-    # nmcli connection-mode (auto vs static) — best effort
-    out = _run_capture(['nmcli', '-t', '-f', 'NAME,DEVICE,STATE',
-                        'con', 'show', '--active'], timeout=2.0)
-    if out:
-        for line in out.splitlines():
-            cols = line.split(':')
-            if len(cols) >= 2 and (cols[1] == iface or cols[1] == 'eth0'):
-                name = cols[0].lower()
-                if 'static' in name:
-                    info['mode'] = 'static'
-                elif 'auto' in name:
-                    info['mode'] = 'auto'
-                break
-    # static IP profielwaarde (alleen tonen wanneer profiel bestaat)
-    sout = _run_capture(['nmcli', '-t', '-f', 'ipv4.addresses',
-                         'con', 'show', 'Wired connection static'], timeout=2.0)
-    if sout:
-        for line in sout.splitlines():
-            if line.startswith('ipv4.addresses:'):
-                val = line.split(':', 1)[1].strip()
-                if val:
-                    info['static_ip'] = val.split('/')[0]
-                break
+    # Mode = the profile active on the port. Without a cable neither profile
+    # is active, so fall back to the one that autoconnects — that is what
+    # ethernet.set_mode configures and what comes up on the next link.
+    by_name = {c['name']: c for c in (cons if cons is not None else _nmcli_connections())}
+    auto = by_name.get(_ETH_PROFILE_AUTO)
+    static = by_name.get(_ETH_PROFILE_STATIC)
+    if static and static['active']:
+        info['mode'] = 'static'
+    elif auto and auto['active']:
+        info['mode'] = 'auto'
+    elif static and static['autoconnect']:
+        info['mode'] = 'static'
+    elif auto and auto['autoconnect']:
+        info['mode'] = 'auto'
+    if static:
+        addresses = _nmcli_profile_fields(_ETH_PROFILE_STATIC, 'ipv4.addresses')
+        first = addresses.get('ipv4.addresses', '').split(',')[0].strip()
+        if first:
+            ip, _, prefix = first.partition('/')
+            info['static_ip'] = ip
+            info['static_prefix'] = int(prefix) if prefix.isdigit() else None
     return info
 
 
-def _wifi_info() -> dict:
+def _wifi_iface() -> "str | None":
+    """First wireless netdev (it has a `wireless` sysfs directory), e.g. wlan0."""
+    try:
+        for name in sorted(os.listdir('/sys/class/net')):
+            if os.path.isdir(f'/sys/class/net/{name}/wireless'):
+                return name
+    except OSError:
+        pass
+    return None
+
+
+def _wifi_radio() -> tuple:
+    """(present, enabled) for the WLAN radio from rfkill. `enabled` = neither
+    soft- nor hard-blocked; `nmcli radio wifi off` sets the soft block."""
+    out = _run_capture(['rfkill', '-J', '--output-all'], timeout=2.0)
+    if out:
+        try:
+            for dev in json.loads(out).get('rfkilldevices', []):
+                if dev.get('type') == 'wlan':
+                    return True, (dev.get('soft') == 'unblocked'
+                                  and dev.get('hard') == 'unblocked')
+        except json.JSONDecodeError:
+            pass
+    return False, False
+
+
+def _wifi_info(cons: "list | None" = None) -> dict:
+    """Wi-Fi state. `mode` follows go-web-ui's wifi type: 'ap' while the
+    GOcontroll-AP profile autoconnects (or is up), otherwise 'client'; 'off'
+    with the radio disabled. `ap_ssid` is the SSID the AP profile broadcasts
+    (the profile itself is always named GOcontroll-AP)."""
+    present, enabled = _wifi_radio()
+    iface = _wifi_iface()
     info = {
-        'enabled':         False,
+        'present':         present or iface is not None,
+        'enabled':         enabled,
         'mode':            'off',
         'connected':       False,
         'ip':              None,
         'ap_ssid':         None,
+        'ap_active':       False,
         'connected_ssid':  None,
+        'signal':          None,
     }
-    out = _run_capture(['rfkill', '-J', '--output-all'], timeout=2.0)
-    if out:
-        try:
-            data = json.loads(out)
-            for dev in data.get('rfkilldevices', []):
-                if dev.get('type') == 'wlan':
-                    info['enabled'] = (dev.get('soft') == 'unblocked'
-                                       and dev.get('hard') == 'unblocked')
-                    break
-        except json.JSONDecodeError:
-            pass
-
-    if not info['enabled']:
+    ap = _nmcli_profile_fields(_WIFI_AP_PROFILE,
+                               '802-11-wireless.ssid', 'connection.autoconnect')
+    info['ap_ssid'] = ap.get('802-11-wireless.ssid') or None
+    if not enabled:
         return info
 
-    # Actieve wifi-connectie?
-    cout = _run_capture(['nmcli', '-t', '-f', 'NAME,DEVICE,TYPE,STATE',
-                         'con', 'show', '--active'], timeout=2.0)
-    if cout:
-        for line in cout.splitlines():
-            cols = line.split(':')
-            if len(cols) >= 4 and cols[2].endswith('wireless'):
-                ssid = cols[0]
-                if ssid == 'GOcontroll-AP':
-                    info['mode'] = 'ap'
-                    info['ap_ssid'] = ssid
-                else:
-                    info['mode'] = 'client'
-                    info['connected'] = True
-                    info['connected_ssid'] = ssid
-                dev = cols[1]
-                if dev:
-                    info['ip'] = _read_iface_ip(dev)
+    if cons is None:
+        cons = _nmcli_connections()
+    ap_con = next((c for c in cons if c['name'] == _WIFI_AP_PROFILE), None)
+    info['ap_active'] = bool(ap_con and ap_con['active'])
+    ap_autoconnect = ap.get('connection.autoconnect') == 'yes'
+    info['mode'] = 'ap' if (ap_autoconnect or info['ap_active']) else 'client'
+
+    client = next((c for c in cons
+                   if c['active'] and c['type'].endswith('wireless')
+                   and c['name'] != _WIFI_AP_PROFILE), None)
+    if client:
+        info['connected'] = True
+        info['connected_ssid'] = client['name']
+        # SSID + signal of the joined network from NM's cached scan list.
+        for row in _wifi_scan_rows(rescan=False):
+            if row['in_use']:
+                info['connected_ssid'] = row['ssid'] or client['name']
+                info['signal'] = row['signal']
                 break
-    if info['mode'] == 'off':
-        # Wifi aan, maar geen connectie — toch het wlan IP melden als er een is
-        info['mode'] = 'client'
-        for dev in ('wlan0', 'wlp0s1'):
-            if os.path.exists(f'/sys/class/net/{dev}'):
-                info['ip'] = _read_iface_ip(dev)
-                break
+    if iface:
+        info['ip'] = _read_iface_ip(iface)
     return info
 
 
@@ -1221,6 +1499,8 @@ def _wwan_info() -> dict:
         'apn':             None,
         'model':           None,
         'signal_pct':      None,
+        'access_tech':     None,
+        'gps':             None,
     }
     # Service-status — als go-wwan inactief is, hoef je mmcli niet te bevragen.
     state = _run_capture(['systemctl', 'is-active', 'go-wwan'], timeout=2.0)
@@ -1261,6 +1541,10 @@ def _wwan_info() -> dict:
     info['service_state'] = _clean(gen.get('state')) or 'off'
     info['imei']          = _clean(three.get('imei'))
     info['operator']      = _clean(three.get('operator-name'))
+    access = [str(t).upper() for t in (gen.get('access-technologies') or [])
+              if _clean(t) and str(t).lower() != 'unknown']
+    info['access_tech']   = ', '.join(access) or None
+    info['gps']           = _wwan_gps(modems[0])
     sig = sq.get('value') if isinstance(sq, dict) else sq
     if sig is not None:
         try:
@@ -1295,10 +1579,72 @@ def _wwan_info() -> dict:
     return info
 
 
+def _wwan_gps(modem_path: str) -> "dict | None":
+    """GNSS state of the 4G module through ModemManager's location API:
+    {enabled, fix, latitude, longitude}. None when the modem has no GPS
+    capability. `enabled` means a GPS source (gps-nmea / gps-raw) is switched
+    on in ModemManager; without that there is no position to report.
+    ModemManager only fills latitude/longitude from the gps-raw source; with
+    just gps-nmea the position comes from the GGA sentence in the NMEA trace."""
+    sout = _run_capture(['mmcli', '-J', '--modem=' + modem_path,
+                         '--location-status'], timeout=3.0)
+    try:
+        loc = (json.loads(sout).get('modem', {}) or {}).get('location', {}) or {}
+    except json.JSONDecodeError:
+        return None
+    capabilities = loc.get('capabilities') or []
+    if not any(str(c).startswith('gps') for c in capabilities):
+        return None
+    enabled = any(str(s) in ('gps-nmea', 'gps-raw') for s in (loc.get('enabled') or []))
+    gps = {'enabled': enabled, 'fix': False, 'latitude': None, 'longitude': None}
+    if not enabled:
+        return gps
+    gout = _run_capture(['mmcli', '-J', '--modem=' + modem_path,
+                         '--location-get'], timeout=3.0)
+    try:
+        fix = ((json.loads(gout).get('modem', {}) or {})
+               .get('location', {}) or {}).get('gps', {}) or {}
+    except json.JSONDecodeError:
+        return gps
+    try:
+        position = (float(fix['latitude']), float(fix['longitude']))
+    except (KeyError, TypeError, ValueError):
+        position = _parse_gga(fix.get('nmea') or [])   # '--' without gps-raw
+    if position is not None:
+        gps['latitude'], gps['longitude'] = position
+        gps['fix'] = True
+    return gps
+
+
+def _parse_gga(sentences) -> "tuple | None":
+    """(latitude, longitude) in decimal degrees from the first GGA sentence
+    with a fix (quality > 0), or None. GGA: $xxGGA,time,ddmm.mmmm,N|S,
+    dddmm.mmmm,E|W,quality,…"""
+    def degrees(value: str, hemisphere: str, negative: str) -> float:
+        raw = float(value)
+        deg = int(raw // 100)
+        result = deg + (raw - deg * 100) / 60.0
+        return -result if hemisphere == negative else result
+
+    for sentence in sentences if isinstance(sentences, list) else []:
+        fields = str(sentence).split('*')[0].split(',')
+        if len(fields) < 7 or not fields[0].endswith('GGA'):
+            continue
+        if fields[6] in ('', '0') or not fields[2] or not fields[4]:
+            continue
+        try:
+            return (round(degrees(fields[2], fields[3], 'S'), 6),
+                    round(degrees(fields[4], fields[5], 'W'), 6))
+        except ValueError:
+            continue
+    return None
+
+
 def _handler_network_info(_params: dict) -> dict:
+    cons = _nmcli_connections()
     return {
-        'ethernet': _ethernet_info(),
-        'wifi':     _wifi_info(),
+        'ethernet': _ethernet_info(cons),
+        'wifi':     _wifi_info(cons),
         'wwan':     _wwan_info(),
     }
 
@@ -1315,25 +1661,25 @@ def _list_can_ifaces() -> list:
         return []
 
 
-def _ip_link_bitrate(ifc: str) -> int:
-    out = _run_capture(['ip', '-j', '-d', 'link', 'show', ifc], timeout=2.0)
-    if not out:
-        return 0
+def _can_link_details() -> dict:
+    """{ifname: (bitrate_bps, state)} for every CAN link from a single
+    `ip -j -d link show type can`. `state` is the controller state the kernel
+    reports (ERROR-ACTIVE / ERROR-PASSIVE / BUS-OFF / STOPPED) or None."""
+    out = _run_capture(['ip', '-j', '-d', 'link', 'show', 'type', 'can'], timeout=2.0)
     try:
-        data = json.loads(out)
-        return int(data[0]['linkinfo']['info_data']['bittiming']['bitrate'])
-    except (json.JSONDecodeError, KeyError, IndexError, ValueError, TypeError):
-        return 0
-
-
-def _bitrate_for(ifc: str) -> int:
-    now = time.monotonic()
-    cached = _can_bitrate_cache.get(ifc)
-    if cached and (now - cached[0]) < _CAN_BITRATE_TTL_S:
-        return cached[1]
-    bitrate = _ip_link_bitrate(ifc)
-    _can_bitrate_cache[ifc] = (now, bitrate)
-    return bitrate
+        links = json.loads(out) if out else []
+    except json.JSONDecodeError:
+        return {}
+    details = {}
+    for link in links if isinstance(links, list) else []:
+        info = (link.get('linkinfo') or {}).get('info_data') or {}
+        try:
+            bitrate = int((info.get('bittiming') or {}).get('bitrate') or 0)
+        except (TypeError, ValueError):
+            bitrate = 0
+        state = info.get('state')
+        details[link.get('ifname')] = (bitrate, state if isinstance(state, str) else None)
+    return details
 
 
 def _can_counters(ifc: str) -> tuple:
@@ -1353,19 +1699,21 @@ def _handler_can_info(_params: dict) -> dict:
     ifaces_out = []
     load = {}
     now = time.monotonic()
+    details = _can_link_details()
     for ifc in _list_can_ifaces():
         # Identifier — laatste cijfer(s) van de iface-naam (can0, can1, …)
         m = re.match(r'^can(\d+)$', ifc)
         ident = int(m.group(1)) if m else 0
 
         operstate = _read_iface_operstate(ifc)
-        kbps = _bitrate_for(ifc)
+        bitrate, state = details.get(ifc, (0, None))
         ifaces_out.append({
             'id':       ident,
             'name':     ifc,
             'present':  True,
             'up':       operstate == 'up',
-            'kbps':     int(kbps / 1000) if kbps > 0 else None,
+            'kbps':     int(bitrate / 1000) if bitrate > 0 else None,
+            'state':    state,
         })
 
         # Busload — delta sinds vorige call. Eerste call seedt en geeft 0.
@@ -1376,9 +1724,9 @@ def _handler_can_info(_params: dict) -> dict:
             dt = now - prev['t']
             dp = max(0, p - prev['p'])
             db = max(0, b - prev['b'])
-            if dt > 0 and kbps > 0:
+            if dt > 0 and bitrate > 0:
                 bits = dp * 47 + db * 8   # CAN classic frame overhead approx
-                pct = max(0.0, min(100.0, (bits / dt) / kbps * 100.0))
+                pct = max(0.0, min(100.0, (bits / dt) / bitrate * 100.0))
         _can_load_state[ifc] = {'t': now, 'p': p, 'b': b}
         load[ifc] = round(pct, 1)
 
@@ -1387,44 +1735,84 @@ def _handler_can_info(_params: dict) -> dict:
 
 # --- services.list / services.set --------------------------------------------
 
-# Whitelist mirrors go-web-ui's handlers/service.py with one substitution:
-# `go-bluetooth` (the legacy RFCOMM server) is replaced by `go-bt` (this
-# service). Including go-bt itself is a deliberate choice — disabling it
-# from the iPhone obviously kills the RPC channel mid-response, so the
-# iPhone times out and recovery requires SSH / webui / physical access.
-# Users who toggle this know what they're doing.
-_SERVICES_WHITELIST = (
-    'ssh',
-    'go-simulink',
-    'nodered',
-    'go-bt',
-    'go-upload-server',
-    'go-auto-shutdown',
-    'gadget-getty@ttyGS0',
-    'getty@ttymxc2',
-    'go-webui',
+# Whitelist (unit, label, description) mirrors go-web-ui's handlers/service.py
+# + js/services.js with two changes: `go-bluetooth` (the legacy RFCOMM server)
+# is replaced by `go-bt` (this service), and `go-wwan` (4G, a page of its own
+# in go-web-ui) is added. Units that are not installed are left out of
+# services.list. Including go-bt itself is deliberate, like go-web-ui lists
+# itself: the app warns before disabling it, and services.set lets the
+# response go out before the stop takes the BLE link down.
+_SERVICES = (
+    ('ssh',                 'SSH',
+     'OpenSSH service, to log in over a network'),
+    ('go-simulink',         'Simulink',
+     'Starts the Simulink model automatically'),
+    ('nodered',             'Node-RED',
+     'The Node-RED programming interface'),
+    ('go-bt',               'Bluetooth server',
+     'This Bluetooth connection to the GOcontroll app'),
+    ('go-upload-server',    'Simulink upload server',
+     'Accepts new Simulink models to be uploaded'),
+    ('go-auto-shutdown',    'Auto shutdown',
+     'Shuts the controller down when K15 is low and Simulink is not running'),
+    ('go-wwan',             '4G / LTE',
+     'Mobile data connection through the 4G modem'),
+    ('gadget-getty@ttyGS0', 'USB terminal',
+     'Log in through the USB interface'),
+    ('getty@ttymxc2',       'Serial terminal',
+     'Log in through the RS232 interface'),
+    ('go-web-ui',           'Web UI',
+     'The browser interface on port 5000'),
 )
+_SERVICES_WHITELIST = tuple(unit for unit, _, _ in _SERVICES)
+_SELF_UNIT = 'go-bt'
+_SELF_STOP_DELAY_MS = 1500      # lets the services.set response frames go out first
+_ENABLED_UNIT_FILE_STATES = ('enabled', 'enabled-runtime', 'static', 'alias')
 
 
-def _systemctl_is_active(unit: str) -> bool:
-    out = _run_capture(['systemctl', 'is-active', unit], timeout=2.0)
-    return out == 'active'
+def _systemctl_states(units) -> dict:
+    """{unit: {loaded, active, enabled}} for `units` from one `systemctl show`.
+    systemctl prints one property block per unit, separated by a blank line;
+    blocks are matched on their Id (`<unit>.service`), falling back to argument
+    order. A unit that is not installed has LoadState=not-found."""
+    units = list(units)
+    out = _run_capture(['systemctl', 'show',
+                        '--property=Id,LoadState,ActiveState,UnitFileState']
+                       + units, timeout=5.0)
+    blocks = [dict(line.split('=', 1) for line in block.splitlines() if '=' in line)
+              for block in out.split('\n\n') if block.strip()] if out else []
+    by_id = {props.get('Id'): props for props in blocks}
+    states = {}
+    for idx, unit in enumerate(units):
+        props = by_id.get(f'{unit}.service')
+        if props is None:
+            if idx >= len(blocks):
+                continue
+            props = blocks[idx]
+        states[unit] = {
+            'loaded':  props.get('LoadState') not in (None, '', 'not-found'),
+            'active':  props.get('ActiveState') == 'active',
+            'enabled': props.get('UnitFileState') in _ENABLED_UNIT_FILE_STATES,
+        }
+    return states
 
 
-def _systemctl_is_enabled(unit: str) -> bool:
-    out = _run_capture(['systemctl', 'is-enabled', unit], timeout=2.0)
-    return out in ('enabled', 'enabled-runtime', 'static', 'alias')
+def _service_entry(unit: str, state: dict) -> dict:
+    label, description = next((l, d) for u, l, d in _SERVICES if u == unit)
+    return {
+        'unit':        unit,
+        'label':       label,
+        'description': description,
+        'active':      state['active'],
+        'enabled':     state['enabled'],
+    }
 
 
 def _handler_services_list(_params: dict) -> dict:
-    services = []
-    for unit in _SERVICES_WHITELIST:
-        services.append({
-            'unit':    unit,
-            'active':  _systemctl_is_active(unit),
-            'enabled': _systemctl_is_enabled(unit),
-        })
-    return {'services': services}
+    states = _systemctl_states(_SERVICES_WHITELIST)
+    return {'services': [_service_entry(unit, states[unit])
+                         for unit in _SERVICES_WHITELIST
+                         if unit in states and states[unit]['loaded']]}
 
 
 def _systemctl_run(verb: str, unit: str) -> tuple:
@@ -1444,7 +1832,18 @@ def _systemctl_run(verb: str, unit: str) -> tuple:
     return True, ''
 
 
+def _stop_self_once() -> bool:
+    """One-shot GLib timeout: stop go-bt after services.set disabled it."""
+    logger.info('services.set: stopping %s as requested over BLE', _SELF_UNIT)
+    subprocess.Popen(['systemctl', 'stop', _SELF_UNIT])
+    return False
+
+
 def _handler_services_set(params: dict) -> dict:
+    """enable=true → systemctl enable + start; enable=false → disable + stop
+    (go-web-ui order: disable first, so a unit that is gone after the stop
+    cannot come back at boot). Stopping go-bt itself is deferred until the
+    response has been sent."""
     _require_auth()
     unit = params.get('unit')
     enable = params.get('enable')
@@ -1453,32 +1852,33 @@ def _handler_services_set(params: dict) -> dict:
     if not isinstance(enable, bool):
         raise ValueError('`enable` must be true or false')
 
-    if enable:
-        ok, err = _systemctl_run('enable', unit)
-        if not ok:
-            raise RuntimeError(err)
-        ok, err = _systemctl_run('start', unit)
-        if not ok:
-            raise RuntimeError(err)
-    else:
-        ok, err = _systemctl_run('stop', unit)
-        if not ok:
-            raise RuntimeError(err)
-        ok, err = _systemctl_run('disable', unit)
+    verbs = ('enable', 'start') if enable else ('disable', 'stop')
+    for verb in verbs:
+        if unit == _SELF_UNIT and verb == 'stop':
+            GLib.timeout_add(_SELF_STOP_DELAY_MS, _stop_self_once)
+            return _service_entry(unit, {'active': False, 'enabled': False})
+        ok, err = _systemctl_run(verb, unit)
         if not ok:
             raise RuntimeError(err)
 
-    return {
-        'unit':    unit,
-        'active':  _systemctl_is_active(unit),
-        'enabled': _systemctl_is_enabled(unit),
-    }
+    state = _systemctl_states([unit]).get(unit, {'active': False, 'enabled': False})
+    return _service_entry(unit, state)
 
 
 # --- ethernet.set_mode / ethernet.set_ip -------------------------------------
 
 _ETH_PROFILE_AUTO   = 'Wired connection auto'
 _ETH_PROFILE_STATIC = 'Wired connection static'
+
+
+def _redacted_args(args) -> str:
+    """Command line for error messages with the value after a secret key
+    (`wifi-sec.psk`, `password`) masked — messages go to the app and the log."""
+    out, hide = [], False
+    for arg in args:
+        out.append('***' if hide else str(arg))
+        hide = arg in ('wifi-sec.psk', 'password')
+    return ' '.join(out)
 
 
 def _nmcli_run(*args, timeout: float = 10.0) -> tuple:
@@ -1491,7 +1891,7 @@ def _nmcli_run(*args, timeout: float = 10.0) -> tuple:
             timeout=timeout, text=True,
         )
     except subprocess.TimeoutExpired:
-        return False, f"nmcli {' '.join(args)}: timeout"
+        return False, f"nmcli {_redacted_args(args)}: timeout"
     if result.returncode != 0:
         msg = (result.stderr or result.stdout).strip() or f'exit {result.returncode}'
         return False, msg
@@ -1524,24 +1924,110 @@ def _handler_ethernet_set_mode(params: dict) -> dict:
     ok, err = _nmcli_run('con', 'up', keep, timeout=20.0)
     if not ok:
         raise RuntimeError(f"failed to activate '{keep}': {err}")
+    if mode == 'static':
+        # The address may have been changed while DHCP was selected (the
+        # pool is only moved while static is selected) — catch up now.
+        static = _ethernet_info().get('static_ip')
+        if static:
+            _sync_dhcp_pool(static)
     return {'mode': mode}
+
+
+_DNSMASQ_CONF = '/etc/dnsmasq.conf'
+# The rootfs serves DHCP on the wired port in static mode, e.g.
+#   dhcp-range=end0,10.100.1.1,10.100.1.250,12h
+_DHCP_RANGE_RE = re.compile(
+    r'^dhcp-range=(?P<iface>eth0|end0),(?P<start>[0-9.]+),(?P<end>[0-9.]+)(?P<rest>,.*)?$'
+)
+
+
+def _dhcp_pool_for(ip: str) -> tuple:
+    """DHCP pool in the /24 of the controller's own static address, on the side
+    of that /24 that leaves the most room: .1 – .(own-1) for a high own
+    address (the factory 10.100.1.254 keeps its pool), else .(own+1) – .254."""
+    octets = ip.split('.')
+    base, own = '.'.join(octets[:3]), int(octets[3])
+    if own > 128:
+        return f'{base}.1', f'{base}.{own - 1}'
+    return f'{base}.{own + 1}', f'{base}.254'
+
+
+def _update_dnsmasq_range(ip: str) -> "str | None":
+    """Move the wired DHCP pool into the new static address' subnet — the
+    step go-web-ui's set_static_ip intends. Only a plain `dhcp-range=<iface>,
+    <start>,<end>[,…]` line for eth0/end0 is rewritten (atomically, through a
+    symlink); any other layout is left alone. Returns the new 'start-end'
+    range, or None when nothing was changed."""
+    path = os.path.realpath(_DNSMASQ_CONF)
+    try:
+        with open(path, 'r', errors='replace') as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return None
+    start, end = _dhcp_pool_for(ip)
+    changed = False
+    for idx, line in enumerate(lines):
+        m = _DHCP_RANGE_RE.match(line.strip())
+        if m:
+            lines[idx] = f"dhcp-range={m['iface']},{start},{end}{m['rest'] or ''}"
+            changed = True
+    if not changed:
+        return None
+    tmp = path + '.go-bt.tmp'
+    try:
+        with open(tmp, 'w') as fh:
+            fh.write('\n'.join(lines) + '\n')
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.warning('dnsmasq: could not write %s (%s); pool left as it was', path, exc)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return None
+    return f'{start}-{end}'
+
+
+def _static_profile_selected() -> bool:
+    """True when the port runs, or will run on the next link, the static
+    profile — only then is the controller the DHCP server on it."""
+    static = next((c for c in _nmcli_connections() if c['name'] == _ETH_PROFILE_STATIC), None)
+    return bool(static and (static['active'] or static['autoconnect']))
+
+
+def _sync_dhcp_pool(ip: str) -> "str | None":
+    """Rewrite the wired pool for `ip` and restart dnsmasq, but only while the
+    static profile is selected: in DHCP mode the port sits on someone else's
+    LAN, and a pool in that LAN's subnet would make the controller a second
+    DHCP server there. Returns the new range or None."""
+    if not _static_profile_selected():
+        return None
+    dhcp_range = _update_dnsmasq_range(ip)
+    if dhcp_range:
+        # dnsmasq reads its config at start only; no-op when it isn't running.
+        _systemctl_run('try-restart', 'dnsmasq')
+    return dhcp_range
 
 
 def _handler_ethernet_set_ip(params: dict) -> dict:
     """Update the static-profile IPv4 address. Uses /16 to match the
     existing go-web-ui contract (controllers ship as DHCP servers on a
-    /16 subnet for industrial deployments). The new address is applied
-    immediately if the static profile is currently active; otherwise it
-    sticks for the next activation."""
+    /16 subnet for industrial deployments) and, while static is selected,
+    moves the dnsmasq pool of the wired port along. The new address is
+    applied immediately if the static profile is currently active; otherwise
+    it sticks for the next activation."""
     _require_auth()
     ip = params.get('ip')
     if not isinstance(ip, str) or not ip:
         raise ValueError('`ip` is required')
     import ipaddress
     try:
-        ipaddress.IPv4Address(ip)
+        addr = ipaddress.IPv4Address(ip)
     except ValueError as exc:
         raise ValueError(f'invalid IPv4 address: {exc}')
+    if (addr.is_multicast or addr.is_loopback or addr.is_unspecified
+            or ip.endswith('.0') or ip.endswith('.255')):
+        raise ValueError(f'{ip} cannot be used as a host address')
 
     ok, err = _nmcli_run(
         'con', 'mod', _ETH_PROFILE_STATIC, 'ipv4.addresses', f'{ip}/16',
@@ -1550,62 +2036,95 @@ def _handler_ethernet_set_ip(params: dict) -> dict:
     if not ok:
         raise RuntimeError(f"failed to set static IP: {err}")
 
-    state = _run_capture(
-        ['nmcli', '-t', '-f', 'GENERAL.STATE', 'con', 'show', _ETH_PROFILE_STATIC],
-        timeout=2.0,
-    )
-    if state and 'activated' in state:
+    state = _nmcli_profile_fields(_ETH_PROFILE_STATIC, 'GENERAL.STATE')
+    if state.get('GENERAL.STATE', '').strip() == 'activated':
         # Bounce the connection so the new IP takes effect now.
         _nmcli_run('con', 'down', _ETH_PROFILE_STATIC, timeout=5.0)
         ok, err = _nmcli_run('con', 'up', _ETH_PROFILE_STATIC, timeout=10.0)
         if not ok:
             raise RuntimeError(f"failed to re-activate static profile: {err}")
-    return {'ip': ip}
+    return {'ip': ip, 'dhcp_range': _sync_dhcp_pool(ip)}
 
 
 # --- wifi.scan / wifi.set_mode / wifi.connect --------------------------------
 
 _WIFI_AP_PROFILE = 'GOcontroll-AP'
+_WIFI_CONNECT_WAIT_S = 35       # nmcli --wait; the subprocess gets 5 s more
+
+
+def _wifi_scan_rows(rescan: bool) -> list:
+    """One row per visible BSSID: {ssid, signal, security, in_use}.
+
+    `--rescan yes` blocks until a fresh scan completes (the user pressed Scan
+    and is waiting); `--rescan no` returns NetworkManager's cached list. The
+    radio cannot scan while it runs the access point — the list is then
+    whatever NM saw last, often empty."""
+    out = _run_capture(['nmcli', '-t', '-f', 'IN-USE,SSID,SIGNAL,SECURITY',
+                        'device', 'wifi', 'list',
+                        '--rescan', 'yes' if rescan else 'no'],
+                       timeout=25.0 if rescan else 5.0)
+    rows = []
+    for line in out.splitlines():
+        cols = _nmcli_split(line)
+        if len(cols) < 4:
+            continue
+        try:
+            signal = int(cols[2])
+        except ValueError:
+            signal = 0
+        rows.append({
+            'ssid':     cols[1],
+            'signal':   signal,
+            'security': '' if cols[3] == '--' else cols[3],
+            'in_use':   cols[0].strip() == '*',
+        })
+    return rows
 
 
 def _wifi_scan_active() -> list:
-    """Trigger nmcli rescan + return visible SSIDs with signal strength.
-
-    `nmcli -t -f SSID,SIGNAL,SECURITY device wifi list --rescan yes` blocks
-    on the rescan (which is what we want — the user pressed Scan and is
-    waiting). De-duplicate by SSID, keep the strongest signal."""
-    # Best-effort rescan trigger; ignore errors.
-    _run_capture(['nmcli', 'device', 'wifi', 'rescan'], timeout=15.0)
-    out = _run_capture(['nmcli', '-t', '-f', 'SSID,SIGNAL,SECURITY',
-                        'device', 'wifi', 'list'], timeout=10.0)
-    if not out:
-        return []
+    """Rescan and return the visible networks, de-duplicated by SSID (the
+    strongest BSSID wins, `in_use` if any BSSID of it is joined), strongest
+    first. Hidden networks (empty SSID) are left out."""
     by_ssid = {}
-    for line in out.splitlines():
-        parts = line.split(':')
-        if len(parts) < 2:
-            continue
-        ssid = parts[0]
+    for row in _wifi_scan_rows(rescan=True):
+        ssid = row['ssid']
         if not ssid:
             continue
-        try:
-            signal = int(parts[1])
-        except ValueError:
-            signal = 0
-        security = parts[2] if len(parts) >= 3 else ''
         existing = by_ssid.get(ssid)
-        if existing is None or signal > existing['signal']:
+        if existing is None or row['signal'] > existing['signal']:
             by_ssid[ssid] = {
                 'ssid':     ssid,
-                'signal':   signal,
-                'secured':  bool(security and security != '--'),
-                'security': security,
+                'signal':   row['signal'],
+                'secured':  bool(row['security']),
+                'security': row['security'],
+                'in_use':   row['in_use'] or bool(existing and existing['in_use']),
             }
+        elif row['in_use']:
+            existing['in_use'] = True
     return sorted(by_ssid.values(), key=lambda e: -e['signal'])
 
 
 def _handler_wifi_scan(_params: dict) -> dict:
     return {'networks': _wifi_scan_active()}
+
+
+def _wifi_client_profiles(cons: "list | None" = None) -> list:
+    """Saved Wi-Fi client profiles — every wireless profile but the AP."""
+    return [c for c in (cons if cons is not None else _nmcli_connections())
+            if c['type'].endswith('wireless') and c['name'] != _WIFI_AP_PROFILE]
+
+
+def _wifi_set_autoconnect(client: bool) -> None:
+    """Make the choice between AP and client survive a reboot, like go-web-ui's
+    set_wifi_type: client → every saved network autoconnects and the AP does
+    not; AP → the other way round."""
+    for con in _wifi_client_profiles():
+        # `id`: a profile literally named "id"/"uuid"/"path" would otherwise
+        # be read as an nmcli keyword.
+        _nmcli_run('con', 'mod', 'id', con['name'], 'connection.autoconnect',
+                   'yes' if client else 'no', timeout=5.0)
+    _nmcli_run('con', 'mod', _WIFI_AP_PROFILE, 'connection.autoconnect',
+               'no' if client else 'yes', timeout=5.0)
 
 
 def _handler_wifi_set_mode(params: dict) -> dict:
@@ -1617,37 +2136,80 @@ def _handler_wifi_set_mode(params: dict) -> dict:
     if mode not in ('ap', 'client'):
         raise ValueError("mode must be 'ap' or 'client'")
 
-    # Discover all wireless connections so we can flip their autoconnect.
-    out = _run_capture(['nmcli', '-t', 'con'], timeout=3.0)
-    wifi_cons = []
-    if out:
-        for line in out.splitlines():
-            cols = line.split(':')
-            if len(cols) >= 3 and cols[2].endswith('wireless') and cols[0] != _WIFI_AP_PROFILE:
-                wifi_cons.append(cols[0])
-
+    _wifi_set_autoconnect(client=(mode == 'client'))
     if mode == 'ap':
-        for con in wifi_cons:
-            _run_capture(['nmcli', 'con', 'mod', con,
-                          'connection.autoconnect', 'no'], timeout=3.0)
-        _run_capture(['nmcli', 'con', 'mod', _WIFI_AP_PROFILE,
-                      'connection.autoconnect', 'yes'], timeout=3.0)
-        ok, err = _systemctl_run('start', 'NetworkManager')   # no-op if running
-        _run_capture(['nmcli', 'con', 'up', _WIFI_AP_PROFILE], timeout=10.0)
-    else:  # client
-        for con in wifi_cons:
-            _run_capture(['nmcli', 'con', 'mod', con,
-                          'connection.autoconnect', 'yes'], timeout=3.0)
-        _run_capture(['nmcli', 'con', 'mod', _WIFI_AP_PROFILE,
-                      'connection.autoconnect', 'no'], timeout=3.0)
-        _run_capture(['nmcli', 'con', 'down', _WIFI_AP_PROFILE], timeout=5.0)
-
+        ok, err = _nmcli_run('con', 'up', _WIFI_AP_PROFILE, timeout=20.0)
+        if not ok:
+            raise RuntimeError(f'failed to start the access point: {err}')
+    else:
+        # NetworkManager then joins a saved network on its own.
+        _nmcli_run('con', 'down', _WIFI_AP_PROFILE, timeout=10.0)
     return {'mode': mode}
+
+
+def _handler_wifi_set_enabled(params: dict) -> dict:
+    """Switch the Wi-Fi radio on or off (`nmcli radio wifi`), like go-web-ui's
+    set_wifi. The configured AP/client mode is kept for when it comes back."""
+    _require_auth()
+    enabled = params.get('enabled')
+    if not isinstance(enabled, bool):
+        raise ValueError('`enabled` must be true or false')
+    ok, err = _nmcli_run('radio', 'wifi', 'on' if enabled else 'off', timeout=10.0)
+    if not ok:
+        raise RuntimeError(f'failed to switch Wi-Fi {"on" if enabled else "off"}: {err}')
+    return {'enabled': enabled}
+
+
+def _handler_wifi_set_ap(params: dict) -> dict:
+    """Change the SSID and/or WPA2 password the GOcontroll-AP profile
+    broadcasts (go-web-ui set_ap_ssid / set_ap_pass). A running AP is
+    restarted so the change takes effect now. The password is never read
+    back."""
+    _require_auth()
+    ssid = params.get('ssid')
+    password = params.get('password')
+    changes = []
+    if ssid is not None:
+        if not isinstance(ssid, str) or not ssid.strip() or len(ssid.encode('utf-8')) > 32:
+            raise ValueError('`ssid` must be 1–32 bytes')
+        changes += ['802-11-wireless.ssid', ssid]
+    if password is not None:
+        if (not isinstance(password, str) or not 8 <= len(password) <= 63
+                or not all(32 <= ord(ch) < 127 for ch in password)):
+            raise ValueError('`password` must be 8–63 printable ASCII characters')
+        changes += ['wifi-sec.psk', password]
+    if not changes:
+        raise ValueError('nothing to change: give `ssid` and/or `password`')
+
+    ok, err = _nmcli_run('con', 'mod', _WIFI_AP_PROFILE, *changes, timeout=5.0)
+    if not ok:
+        raise RuntimeError(f'failed to update the access point: {err}')
+    ap_active = any(c['name'] == _WIFI_AP_PROFILE and c['active']
+                    for c in _nmcli_connections())
+    if ap_active:
+        _nmcli_run('con', 'down', _WIFI_AP_PROFILE, timeout=10.0)
+        ok, err = _nmcli_run('con', 'up', _WIFI_AP_PROFILE, timeout=20.0)
+        if not ok:
+            raise RuntimeError(f'access point updated but failed to restart: {err}')
+    ap = _nmcli_profile_fields(_WIFI_AP_PROFILE, '802-11-wireless.ssid')
+    return {'ap_ssid': ap.get('802-11-wireless.ssid') or None, 'ap_active': ap_active}
+
+
+def _wifi_connected_result(name: str) -> dict:
+    """Fresh snapshot for a connect response, so the app does not have to wait
+    for its next network.info refresh."""
+    info = _wifi_info()
+    return {
+        'ssid':       info.get('connected_ssid') or name,
+        'connected':  bool(info.get('connected')),
+        'ip':         info.get('ip'),
+    }
 
 
 def _handler_wifi_connect(params: dict) -> dict:
     """Connect to a WiFi network as a client. Creates / updates the nmcli
-    connection profile and brings it up. Returns the resolved IP on success."""
+    connection profile and brings it up, then switches the autoconnect flags
+    to client mode so the choice survives a reboot."""
     _require_auth()
     ssid = params.get('ssid')
     password = params.get('password', '')
@@ -1656,28 +2218,70 @@ def _handler_wifi_connect(params: dict) -> dict:
     if not isinstance(password, str):
         raise ValueError('`password` must be a string (use "" for open networks)')
 
-    cmd = ['nmcli', 'device', 'wifi', 'connect', ssid]
+    # --wait below the subprocess timeout: nmcli gives up (and reports why)
+    # before we would kill it while NetworkManager keeps activating.
+    cmd = ['nmcli', '--wait', str(_WIFI_CONNECT_WAIT_S), 'device', 'wifi', 'connect', ssid]
     if password:
         cmd += ['password', password]
     try:
         result = subprocess.run(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=30, text=True,
+            timeout=_WIFI_CONNECT_WAIT_S + 5, text=True,
         )
     except subprocess.TimeoutExpired:
-        raise RuntimeError(f'connect {ssid}: timeout')
-    if result.returncode != 0:
+        # `from None`: the chained TimeoutExpired would put the password
+        # (it is in the argv) into the log via logger.exception.
+        raise RuntimeError(f'connect {ssid}: timeout') from None
+    # Some nmcli versions exit 0 but print "Error: …" (noted in go-web-ui).
+    failed = result.returncode != 0 or 'Error:' in result.stdout
+    if failed:
         msg = (result.stderr or result.stdout).strip() or f'exit {result.returncode}'
         raise RuntimeError(f'connect {ssid}: {msg}')
 
-    # Probe the wifi info immediately so the iOS-side gets a fresh snapshot
-    # in the same response, instead of waiting for the next refresh tick.
-    info = _wifi_info()
-    return {
-        'ssid':       ssid,
-        'connected':  bool(info.get('connected')),
-        'ip':         info.get('ip'),
-    }
+    _wifi_set_autoconnect(client=True)
+    return _wifi_connected_result(ssid)
+
+
+def _handler_wifi_saved(_params: dict) -> dict:
+    """Saved client networks: [{name, active, autoconnect}]. `name` is the
+    NetworkManager profile name — the SSID for networks joined via
+    wifi.connect."""
+    return {'networks': [
+        {'name': c['name'], 'active': c['active'], 'autoconnect': c['autoconnect']}
+        for c in _wifi_client_profiles()
+    ]}
+
+
+def _saved_wifi_profile(params: dict) -> str:
+    name = params.get('name')
+    if not isinstance(name, str) or not name:
+        raise ValueError('`name` is required')
+    if name not in {c['name'] for c in _wifi_client_profiles()}:
+        raise ValueError(f'no saved Wi-Fi network named {name!r}')
+    return name
+
+
+def _handler_wifi_connect_saved(params: dict) -> dict:
+    """Join a saved network (no password needed) and switch to client mode."""
+    _require_auth()
+    name = _saved_wifi_profile(params)
+    ok, err = _nmcli_run('--wait', str(_WIFI_CONNECT_WAIT_S), 'con', 'up', 'id', name,
+                         timeout=_WIFI_CONNECT_WAIT_S + 5)
+    if not ok:
+        raise RuntimeError(f'connect {name}: {err}')
+    _wifi_set_autoconnect(client=True)
+    return _wifi_connected_result(name)
+
+
+def _handler_wifi_forget(params: dict) -> dict:
+    """Delete a saved client network profile. The AP profile cannot be
+    removed this way."""
+    _require_auth()
+    name = _saved_wifi_profile(params)
+    ok, err = _nmcli_run('con', 'delete', 'id', name, timeout=10.0)
+    if not ok:
+        raise RuntimeError(f'forget {name}: {err}')
+    return {'name': name}
 
 
 # --- can.set_bitrate ---------------------------------------------------------
@@ -1716,10 +2320,6 @@ def _handler_can_set_bitrate(params: dict) -> dict:
         msg = (result.stderr or result.stdout).strip() or f'exit {result.returncode}'
         raise RuntimeError(f'go-can set {iface} bitrate: {msg}')
 
-    # Update bitrate cache so the next can.info call reflects the change
-    # immediately instead of returning the stale TTL'd value.
-    _can_bitrate_cache[iface] = (time.monotonic(), bitrate)
-
     operstate = _read_iface_operstate(iface)
     return {
         'interface': iface,
@@ -1755,23 +2355,9 @@ def _read_pass_hash() -> str:
     Default: sha256 van de canonical lowercase end0 MAC met dubbele punten,
     bv. `sha256("00:0c:c6:94:91:77")`. Hash-input is dus exact wat IDENTITY
     teruggeeft als string-form."""
-    if os.path.exists(CONF_PATH):
-        try:
-            with open(CONF_PATH, 'r') as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line or line.startswith('#'):
-                        continue
-                    if '=' not in line:
-                        continue
-                    key, _, val = line.partition('=')
-                    if key.strip() == 'pass_hash':
-                        h = val.strip().lower()
-                        if len(h) == 64 and all(c in '0123456789abcdef' for c in h):
-                            return h
-        except OSError as exc:
-            logger.warning('auth: failed to read %s (%s); falling back to MAC default',
-                           CONF_PATH, exc)
+    h = _read_conf().get('pass_hash', '').lower()
+    if len(h) == 64 and all(c in '0123456789abcdef' for c in h):
+        return h
     mac = _read_identity_mac()
     canonical = ':'.join(f'{b:02x}' for b in mac)
     return hashlib.sha256(canonical.encode('ascii')).hexdigest()
@@ -1810,6 +2396,7 @@ def _require_auth() -> None:
 _HANDLERS = {
     'auth.login':         _handler_auth_login,
     'system.stats':       _handler_system_stats,
+    'system.software':    _handler_system_software,
     'modules.info':              _handler_modules_info,
     'modules.channels.config':   _handler_modules_channels_config,
     'modules.channels.values':   _handler_modules_channels_values,
@@ -1820,8 +2407,13 @@ _HANDLERS = {
     'ethernet.set_mode':  _handler_ethernet_set_mode,
     'ethernet.set_ip':    _handler_ethernet_set_ip,
     'wifi.scan':          _handler_wifi_scan,
+    'wifi.saved':         _handler_wifi_saved,
+    'wifi.set_enabled':   _handler_wifi_set_enabled,
     'wifi.set_mode':      _handler_wifi_set_mode,
+    'wifi.set_ap':        _handler_wifi_set_ap,
     'wifi.connect':       _handler_wifi_connect,
+    'wifi.connect_saved': _handler_wifi_connect_saved,
+    'wifi.forget':        _handler_wifi_forget,
     'can.set_bitrate':    _handler_can_set_bitrate,
 }
 
