@@ -1063,6 +1063,11 @@ def _handler_modules_info(_params: dict) -> dict:
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f'cannot read modules.json: {exc}')
 
+    # go-modules 3.2.0 wraps the slot list ({"schema_version", "controller",
+    # "slots": [...]}); older versions wrote the bare list. Same per-slot keys.
+    if isinstance(raw, dict):
+        raw = raw.get('slots')
+
     slots = []
     if isinstance(raw, list):
         for entry in raw:
