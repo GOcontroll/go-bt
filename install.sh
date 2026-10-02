@@ -35,8 +35,16 @@ INSTALL_DIR="/opt/gocontroll/go-bt"
 # and have all the C-extension build sorted out — and only fall back to pip
 # (with --break-system-packages) for bluezero, which is pure-Python.
 info "Installing apt-packaged Python deps (python3-dbus, python3-gi)..."
+# Refresh the package lists first: on an image whose lists are older than the
+# archive, `apt-get install` 404s on superseded .debs.
+DEBIAN_FRONTEND=noninteractive apt-get update -q \
+    || warn "apt-get update failed — trying the install with the current lists"
 DEBIAN_FRONTEND=noninteractive apt-get install -y python3-dbus python3-gi \
     || warn "apt install failed — continuing in case packages are already present"
+# Without these, pip would try to build PyGObject (a bluezero dependency) from
+# source, which fails on the controller for lack of cairo / pkg-config.
+python3 -c 'import dbus, gi' 2>/dev/null \
+    || fail "python3-dbus / python3-gi missing. Run: apt-get update && apt-get install python3-dbus python3-gi"
 
 info "Installing bluezero via pip (system-wide, --break-system-packages)..."
 pip3 install --break-system-packages bluezero \
