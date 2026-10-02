@@ -33,6 +33,11 @@ set -e
 LOG_PREFIX="go-bt-bdaddr"
 ETH_PATH="/sys/class/net/end0/address"
 
+# btmgmt (BlueZ 5.82) hangs instead of exiting when its stdin is at EOF —
+# and /dev/null is the stdin systemd gives a service. An open pipe that
+# never delivers input lets it exit as soon as the command completes.
+btmgmt0() { timeout 5 btmgmt --index 0 "$@" < <(sleep 6); }
+
 if [[ ! -f "$ETH_PATH" ]]; then
     echo "$LOG_PREFIX: $ETH_PATH not present — skipping"
     exit 0
@@ -70,7 +75,7 @@ echo "$LOG_PREFIX: $CURRENT → $LE_ADDR (derived from end0 $ETH_MAC)"
 ATTEMPT=0
 while true; do
     ATTEMPT=$((ATTEMPT + 1))
-    if timeout 5 btmgmt --index 0 power off >/dev/null 2>&1; then
+    if btmgmt0 power off >/dev/null 2>&1; then
         echo "$LOG_PREFIX: power off succeeded on attempt $ATTEMPT"
         break
     fi
@@ -86,12 +91,12 @@ done
 # "Invalid Index" because changing the address removes the old adapter
 # index from the kernel mgmt API; bluetoothd re-adds it under the new
 # address shortly after. We treat that error as benign.
-if ! timeout 5 btmgmt --index 0 public-addr "$LE_ADDR" >/dev/null 2>&1; then
+if ! btmgmt0 public-addr "$LE_ADDR" >/dev/null 2>&1; then
     echo "$LOG_PREFIX: WARNING — btmgmt public-addr failed; restoring power" >&2
-    timeout 5 btmgmt --index 0 power on >/dev/null 2>&1 || true
+    btmgmt0 power on >/dev/null 2>&1 || true
     exit 1
 fi
-timeout 5 btmgmt --index 0 power on >/dev/null 2>&1 || true
+btmgmt0 power on >/dev/null 2>&1 || true
 sleep 1
 
 echo "$LOG_PREFIX: hci0 now at $LE_ADDR; restarting go-bt to advertise with new address"

@@ -4,11 +4,10 @@ Documentation=https://github.com/GOcontroll/go-bt
 ConditionPathExists=/sys/class/net/end0
 
 [Service]
-# Type=simple matches what `systemd-run` uses for its transient units —
-# `Type=oneshot` provoked btmgmt to hang indefinitely when the script
-# was triggered by go-bt-bdaddr.timer, even though the same script ran
-# fine interactively and via `systemd-run --wait`. The exact mechanism
-# isn't documented but the workaround sticks.
+# Type=simple matches what `systemd-run` uses for its transient units.
+# The btmgmt hang once blamed on `Type=oneshot` is btmgmt blocking on the
+# /dev/null stdin systemd gives every service; go-bt-bdaddr.sh feeds it
+# an open pipe instead.
 Type=simple
 ExecStart=/usr/local/sbin/go-bt-bdaddr.sh
 
